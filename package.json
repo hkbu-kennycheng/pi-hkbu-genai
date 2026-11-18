@@ -1,0 +1,25 @@
+{
+  "name": "pi-hkbu-genai",
+  "version": "1.0.0",
+  "description": "HKBU GenAI OpenAI-compatible provider and Akamai 403 / 400 compatibility fixes for Pi",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hkbu-kennycheng/pi-hkbu-genai.git"
+  },
+  "scripts": {
+    "test": "node --test test/hkbu-genai.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/hkbu-genai.ts"
+    ]
+  }
+}
