@@ -157,6 +157,9 @@ export const HKBU_DEFAULT_MODELS: HkbuModelCatalogEntry[] = [
 
 const ANSI_ESCAPE_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g;
 const WAF_LINE_PATTERNS = [/<script\b/i, /\beval\s*\(/i, /\balert\s*\(/i];
+const HTML_OR_WAF_ARGS_RE = /<script\b|<style\b|<!doctype\b|<html\b|@import\b|\beval\s*\(|\balert\s*\(/i;
+const HEREDOC_RE = /<<\s*['"]?[A-Z_a-z0-9-]+['"]?/;
+const MAX_REPLAYED_FILE_TOOL_ARG_CHARS = 350;
 
 export function isHkbuEndpointModel(model: { provider?: string; baseUrl?: string } | undefined): boolean {
 	if (!model) return false;
@@ -188,11 +191,11 @@ export function checkToolCallSafety(toolName: string, input: Record<string, unkn
 					"Blocked locally before execution: shell chaining operators (semicolon, double-ampersand, or double-pipe) inside bash tool arguments trigger HKBU Akamai 403 when tool history is replayed. Run one simple command per bash call, write a script file first with write, or use built-in read/ls/find/grep tools.",
 			};
 		}
-		if (WAF_LINE_PATTERNS.some((re) => re.test(cmd))) {
+		if (HTML_OR_WAF_ARGS_RE.test(cmd) || (HEREDOC_RE.test(cmd) && cmd.length > 250)) {
 			return {
 				blocked: true,
 				reason:
-					"Blocked locally before execution: HTML script tags or JS eval/alert calls inside bash tool arguments trigger HKBU Akamai 403 when tool history is replayed. Write code to a file with write instead of passing it inline in bash arguments.",
+					"Blocked locally before execution: HTML/CSS/script tags, JS eval/alert calls, or large heredocs inside bash tool arguments trigger HKBU Akamai 403 when tool history is replayed. Use the write tool instead.",
 			};
 		}
 	}
@@ -359,6 +362,111 @@ function extractToolText(content: unknown): string {
 	return content == null ? "" : String(content);
 }
 
+function parseToolArgs(rawArgs: unknown): { obj: Record<string, any> | null; serialized: string } {
+	if (typeof rawArgs === "string") {
+		try {
+			const parsed = JSON.parse(rawArgs);
+			return { obj: parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null, serialized: rawArgs };
+		} catch {
+			return { obj: null, serialized: rawArgs };
+		}
+	}
+	if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+		return { obj: rawArgs as Record<string, any>, serialized: JSON.stringify(rawArgs) };
+	}
+	return { obj: null, serialized: rawArgs == null ? "" : String(rawArgs) };
+}
+
+export function isSuspectToolCallArgs(toolName: string, rawArgs: unknown): boolean {
+	const { serialized } = parseToolArgs(rawArgs);
+	return serialized.length > MAX_REPLAYED_FILE_TOOL_ARG_CHARS || HTML_OR_WAF_ARGS_RE.test(serialized);
+}
+
+/**
+ * Compact completed file-mutation (`write`/`edit`) tool call arguments — or explicitly flagged
+ * tool calls after a 403/400 — when replaying conversation history so large code/HTML/script
+ * bodies already written to disk do not re-trigger HKBU Akamai 403 in `tool_calls[].function.arguments`.
+ */
+export function compactToolCallArgsIfNeeded(
+	toolName: string,
+	rawArgs: unknown,
+	forceCompact = false,
+): { compacted: boolean; compactedArgs: Record<string, unknown> } {
+	const { obj, serialized } = parseToolArgs(rawArgs);
+	const isFileTool = toolName === "write" || toolName === "edit";
+	const suspect = serialized.length > MAX_REPLAYED_FILE_TOOL_ARG_CHARS || HTML_OR_WAF_ARGS_RE.test(serialized);
+
+	if (!forceCompact && !(isFileTool && suspect)) {
+		return { compacted: false, compactedArgs: obj ?? {} };
+	}
+
+	if (toolName === "write") {
+		const filePath = typeof obj?.path === "string" ? obj.path : "";
+		const contentLen = typeof obj?.content === "string" ? obj.content.length : serialized.length;
+		return {
+			compacted: true,
+			compactedArgs: {
+				path: filePath,
+				content: `[${contentLen} chars written to ${filePath || "file"}; full contents stored on disk]`,
+			},
+		};
+	}
+
+	if (toolName === "edit") {
+		const filePath = typeof obj?.path === "string" ? obj.path : "";
+		let editChars = 0;
+		if (Array.isArray(obj?.edits)) {
+			for (const e of obj.edits) {
+				if (e && typeof e === "object") {
+					editChars += String(e.oldText ?? "").length + String(e.newText ?? "").length;
+				}
+			}
+			return {
+				compacted: true,
+				compactedArgs: {
+					path: filePath,
+					edits: [
+						{
+							oldText: "[omitted]",
+							newText: `[${editChars || serialized.length} chars edited in ${filePath || "file"}; full file stored on disk]`,
+						},
+					],
+				},
+			};
+		}
+		editChars = String(obj?.oldText ?? "").length + String(obj?.newText ?? "").length || serialized.length;
+		return {
+			compacted: true,
+			compactedArgs: {
+				path: filePath,
+				oldText: "[omitted]",
+				newText: `[${editChars} chars edited in ${filePath || "file"}; full file stored on disk]`,
+			},
+		};
+	}
+
+	if (!forceCompact) {
+		return { compacted: false, compactedArgs: obj ?? {} };
+	}
+
+	if (toolName === "bash") {
+		return {
+			compacted: true,
+			compactedArgs: { command: `[${serialized.length} chars omitted after gateway 403/400]` },
+		};
+	}
+	if (toolName === "codemode") {
+		return {
+			compacted: true,
+			compactedArgs: { code: `// [${serialized.length} chars omitted after gateway 403/400]` },
+		};
+	}
+	return {
+		compacted: true,
+		compactedArgs: { _compacted: `[${serialized.length} chars omitted after gateway 403/400]` },
+	};
+}
+
 /**
  * Normalize an outgoing OpenAI `chat/completions` payload right before it hits the wire
  * to prevent known 400 errors on https://genai.hkbu.edu.hk/api/v1.
@@ -394,6 +502,27 @@ export function sanitizeProviderPayload(payload: unknown, fallbackModelId = ""):
 
 	if (!Array.isArray(p.messages)) {
 		return p;
+	}
+
+	// Compact completed write/edit tool_calls arguments on replay so HTML/JS payloads on disk
+	// do not trigger Akamai WAF 403 when re-sent in conversation history or folded for Gemini.
+	const completedToolIds = new Set<string>();
+	for (const msg of p.messages) {
+		if (msg?.role === "tool" && typeof msg.tool_call_id === "string") {
+			completedToolIds.add(msg.tool_call_id);
+		}
+	}
+	for (const msg of p.messages) {
+		if (msg?.role === "assistant" && Array.isArray(msg.tool_calls)) {
+			for (const tc of msg.tool_calls) {
+				if (typeof tc?.id === "string" && completedToolIds.has(tc.id) && tc.function) {
+					const res = compactToolCallArgsIfNeeded(tc.function.name ?? "", tc.function.arguments, false);
+					if (res.compacted) {
+						tc.function.arguments = JSON.stringify(res.compactedArgs);
+					}
+				}
+			}
+		}
 	}
 
 	const modelId = typeof p.model === "string" && p.model.length > 0 ? p.model : fallbackModelId;
@@ -474,6 +603,7 @@ export interface CompactionState {
 	blockedToolCallIds: Set<string>;
 	droppedMessageTimestamps: Set<number>;
 	replacedToolResults: Map<string, string>;
+	compactedToolCallIds?: Set<string>;
 }
 
 export interface CompactionOptions {
@@ -518,6 +648,12 @@ export function compactMessagesForBudget(
 
 	let changed = false;
 	const cleaned: any[] = [];
+	const completedToolCallIds = new Set<string>();
+	for (const msg of messages) {
+		if (msg?.role === "toolResult" && typeof msg.toolCallId === "string") {
+			completedToolCallIds.add(msg.toolCallId);
+		}
+	}
 
 	for (const msg of messages) {
 		if (!msg) continue;
@@ -528,22 +664,31 @@ export function compactMessagesForBudget(
 			continue;
 		}
 
-		// Clean assistant messages containing preflight-blocked tool calls so Akamai never sees blocked args
+		// Clean assistant messages containing preflight-blocked tool calls or large/HTML write/edit args
 		if (msg.role === "assistant" && Array.isArray(msg.content)) {
-			const hasBlockedToolCall = msg.content.some(
-				(b: any) => b?.type === "toolCall" && state.blockedToolCallIds.has(b.id),
-			);
-			if (hasBlockedToolCall) {
-				changed = true;
-				const keptBlocks = msg.content.map((b: any) => {
-					if (b?.type === "toolCall" && state.blockedToolCallIds.has(b.id)) {
+			let msgModified = false;
+			const keptBlocks = msg.content.map((b: any) => {
+				if (b?.type === "toolCall") {
+					if (state.blockedToolCallIds.has(b.id)) {
+						msgModified = true;
 						return {
 							type: "text",
 							text: `[Blocked local ${b.name} tool call before execution to avoid HKBU Akamai 403]`,
 						};
 					}
-					return b;
-				});
+					const forced = Boolean(state.compactedToolCallIds?.has(b.id));
+					if (completedToolCallIds.has(b.id) || forced) {
+						const res = compactToolCallArgsIfNeeded(b.name ?? "", b.arguments, forced);
+						if (res.compacted) {
+							msgModified = true;
+							return { ...b, arguments: res.compactedArgs };
+						}
+					}
+				}
+				return b;
+			});
+			if (msgModified) {
+				changed = true;
 				cleaned.push({ ...msg, content: keptBlocks });
 				continue;
 			}

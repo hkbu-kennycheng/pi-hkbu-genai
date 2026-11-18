@@ -225,6 +225,98 @@ test("compactMessagesForBudget strips blocked/errored/orphaned entries and compa
 	assert.equal(pairRes.changed, true);
 	assert.ok(pairRes.messages[2].content[0].text.includes("compacted from 4500 chars"));
 	assert.equal(pairRes.messages[4].content[0].text, "B".repeat(4500));
+
+	// Compacts completed write/edit HTML+JS toolCall arguments on replay (keeps tiny write intact)
+	const writeState: CompactionState = {
+		blockedToolCallIds: new Set(),
+		droppedMessageTimestamps: new Set(),
+		replacedToolResults: new Map(),
+		compactedToolCallIds: new Set(["tc_forced"]),
+	};
+	const writeCompacted = compactMessagesForBudget(
+		[
+			{ role: "user", content: [{ type: "text", text: "build 3D page" }] },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "w_html",
+						name: "write",
+						arguments: { path: "index.html", content: "<!doctype html><html><script src='app.js'></script></html>" },
+					},
+				],
+				timestamp: 10,
+			},
+			{ role: "toolResult", toolCallId: "w_html", toolName: "write", content: [{ type: "text", text: "ok" }], timestamp: 11 },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "w_small",
+						name: "write",
+						arguments: { path: "cfg.json", content: '{"ok":true}' },
+					},
+				],
+				timestamp: 12,
+			},
+			{ role: "toolResult", toolCallId: "w_small", toolName: "write", content: [{ type: "text", text: "ok" }], timestamp: 13 },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "e_large",
+						name: "edit",
+						arguments: { path: "scene.js", edits: [{ oldText: "a", newText: "x".repeat(600) }] },
+					},
+				],
+				timestamp: 14,
+			},
+			{ role: "toolResult", toolCallId: "e_large", toolName: "edit", content: [{ type: "text", text: "ok" }], timestamp: 15 },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tc_forced", name: "bash", arguments: { command: "echo " + "z".repeat(400) } }],
+				timestamp: 16,
+			},
+			{ role: "toolResult", toolCallId: "tc_forced", toolName: "bash", content: [{ type: "text", text: "ok" }], timestamp: 17 },
+		],
+		writeState,
+	);
+	assert.equal(writeCompacted.changed, true);
+	assert.equal(writeCompacted.messages[1].content[0].arguments.content.includes("<script"), false);
+	assert.ok(writeCompacted.messages[1].content[0].arguments.content.includes("index.html"));
+	assert.equal(writeCompacted.messages[3].content[0].arguments.content, '{"ok":true}');
+	assert.ok(writeCompacted.messages[5].content[0].arguments.edits[0].newText.includes("scene.js"));
+	assert.ok(writeCompacted.messages[7].content[0].arguments.command.includes("omitted after gateway 403/400"));
+});
+
+test("sanitizeProviderPayload compacts completed write/edit tool_calls before Gemini folding", () => {
+	const out = sanitizeProviderPayload({
+		model: "gemini-3.8-flash",
+		messages: [
+			{ role: "user", content: "hi" },
+			{
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					{
+						id: "call_w1",
+						type: "function",
+						function: {
+							name: "write",
+							arguments: JSON.stringify({ path: "scene.js", content: "const x = 1;\n".repeat(400) }),
+						},
+					},
+				],
+			},
+			{ role: "tool", tool_call_id: "call_w1", content: "Successfully wrote" },
+		],
+	}) as any;
+	assert.equal(out.messages[1].tool_calls, undefined);
+	assert.equal(out.messages[1].content.includes("const x = 1;"), false);
+	assert.ok(out.messages[1].content.includes("full contents stored on disk"));
 });
 
 test("diagnoseProviderError extracts Akamai reference code and 400 reason", () => {

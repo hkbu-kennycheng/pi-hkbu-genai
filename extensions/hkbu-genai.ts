@@ -11,6 +11,7 @@ import {
 	HKBU_GENAI_BASE_URL,
 	HKBU_PROVIDER_ID,
 	isHkbuEndpointModel,
+	isSuspectToolCallArgs,
 	sanitizeProviderPayload,
 	sanitizeToolOutputText,
 	type CompactionState,
@@ -51,6 +52,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		blockedToolCallIds: new Set<string>(),
 		droppedMessageTimestamps: new Set<number>(),
 		replacedToolResults: new Map<string, string>(),
+		compactedToolCallIds: new Set<string>(),
 	};
 
 	const stats = {
@@ -134,6 +136,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		state.blockedToolCallIds.clear();
 		state.droppedMessageTimestamps.clear();
 		state.replacedToolResults.clear();
+		state.compactedToolCallIds?.clear();
 	});
 
 	// 1. Prompt hygiene so the agent avoids Akamai-triggering patterns naturally
@@ -294,14 +297,29 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		// Also compact any older active large toolResult entries (e.g. an earlier `read`
-		// of a long reference doc whose cumulative WAF anomaly score triggered 403 once earlier
-		// messages were compacted into Akamai's inspection buffer).
+		// Also compact any older active large toolResult entries and flag suspect historical
+		// toolCall arguments (e.g. write/edit HTML/JS or large scripts replayed before `continue`).
 		const droppedToolIds = new Set(targetToolEntryIds);
+		let compactedHistorical = false;
 		for (let i = activeEntries.length - 1; i >= 0; i--) {
 			const pe = activeEntries[i];
 			const entryId = pe.sourceEntry?.id;
 			const entryMsg: any = pe.messages[0];
+			if (entryMsg?.role === "assistant" && Array.isArray(entryMsg.content)) {
+				if (entryId && entryId === pairedAssistantEntryId) continue;
+				for (const block of entryMsg.content) {
+					if (
+						block?.type === "toolCall" &&
+						typeof block.id === "string" &&
+						!state.compactedToolCallIds?.has(block.id) &&
+						isSuspectToolCallArgs(block.name ?? "", block.arguments)
+					) {
+						state.compactedToolCallIds?.add(block.id);
+						compactedHistorical = true;
+					}
+				}
+				continue;
+			}
 			if (entryMsg?.role !== "toolResult") continue;
 			if (entryId && droppedToolIds.has(entryId)) continue;
 			const textLen = (entryMsg.content ?? [])
@@ -310,8 +328,9 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 			if (textLen > 400) {
 				const trId = entryMsg.toolCallId as string | undefined;
 				const replacement = `[Tool result (${entryMsg.toolName ?? "tool"}, ${textLen} chars) compacted after ${diagnosis.summary}. Re-read smaller targeted ranges if needed.]`;
-				if (trId) {
+				if (trId && state.replacedToolResults.get(trId) !== replacement) {
 					state.replacedToolResults.set(trId, replacement);
+					compactedHistorical = true;
 				}
 				if (entryId) {
 					edits.push({ type: "context_edit", targetId: entryId, replacement: { content: replacement } });
@@ -319,11 +338,11 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		if (pairedAssistantEntryId && targetToolEntryIds.length > 0) {
+		if ((pairedAssistantEntryId && targetToolEntryIds.length > 0) || compactedHistorical) {
 			edits.push({
 				type: "custom_message",
 				customType: "hkbu-genai-recovery",
-				content: `[hkbu-genai recovery] Removed the preceding tool turn and compacted large historical tool outputs after ${diagnosis.summary}. Local logs remain saved under ${logDir}. Continue using single commands, smaller read ranges (<=80 lines), or structured tools.`,
+				content: `[hkbu-genai recovery] Cleaned triggering tool history and compacted large historical tool payloads after ${diagnosis.summary}. Local logs remain saved under ${logDir}. Continue using single commands, smaller read ranges (<=30 lines), or write/edit tools.`,
 				display: true,
 			});
 		}
