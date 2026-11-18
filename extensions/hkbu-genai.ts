@@ -19,8 +19,8 @@ import {
 
 const BASH_MAX_BYTES = 12 * 1024;
 const BASH_MAX_LINES = 180;
-const READ_MAX_BYTES = 24 * 1024;
-const READ_MAX_LINES = 400;
+const READ_MAX_BYTES = 6 * 1024;
+const READ_MAX_LINES = 80;
 
 export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 	const logDir = join(tmpdir(), "pi-hkbu-genai", String(process.pid));
@@ -123,6 +123,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 				event.systemPrompt +
 				`\n\n[HKBU GenAI Gateway Rules]
 - Prefer structured built-in tools (read, ls, find, grep, edit, write) over bash or codemode for file inspection and edits.
+- When using read on docs or code files, read small targeted ranges (offset/limit of ~80 lines) rather than loading long files at once.
 - When using bash, run ONE simple command per call (no shell chaining operators like semicolon, double-ampersand, or double-pipe in bash arguments). If multiple steps are needed, make separate bash tool calls or write a script file with write and execute it.
 - Never embed HTML script tags, eval calls, or alert calls inside bash tool command arguments.
 - Keep command outputs concise instead of dumping massive unfiltered logs.`,
@@ -227,29 +228,31 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 			edits.push({ type: "context_edit", targetId: event.messageEntryId, replacement: null });
 		}
 
-		// Walk back to find any toolResult(s) + paired assistant toolCall turn right before this error.
-		// Omitting both the toolResult and its triggering assistant toolCall entry unbricks both
-		// Akamai 403 (which inspects tool_calls.function.arguments AND tool contents) and 400 errors.
-		const branch = ctx.sessionManager.getBranch();
+		// Walk back through the active projected entries (ignoring already-omitted entries)
+		// to find any toolResult(s) + paired assistant toolCall turn right before this error.
+		const activeEntries = (event.context?.contextEntries ?? []).filter(
+			(pe) => pe.messages.length > 0 && pe.sourceEntry?.id !== event.messageEntryId,
+		);
 		const targetToolEntryIds: string[] = [];
 		let pairedAssistantEntryId: string | undefined;
 		let pairedAssistantTimestamp: number | undefined;
 
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const entry: any = branch[i];
-			if (entry?.id === event.messageEntryId) continue;
-			if (entry?.type === "message" && entry.message?.role === "toolResult") {
-				if (entry.id) targetToolEntryIds.push(entry.id);
-				if (typeof entry.message.toolCallId === "string") {
-					state.blockedToolCallIds.add(entry.message.toolCallId);
+		for (let i = activeEntries.length - 1; i >= 0; i--) {
+			const pe = activeEntries[i];
+			const entryId = pe.sourceEntry?.id;
+			const entryMsg: any = pe.messages[0];
+			if (entryMsg?.role === "toolResult") {
+				if (entryId) targetToolEntryIds.push(entryId);
+				if (typeof entryMsg.toolCallId === "string") {
+					state.blockedToolCallIds.add(entryMsg.toolCallId);
 				}
 				continue;
 			}
-			if (entry?.type === "message" && entry.message?.role === "assistant") {
-				if (targetToolEntryIds.length > 0 && Array.isArray(entry.message.content)) {
-					pairedAssistantEntryId = entry.id;
-					pairedAssistantTimestamp = entry.message.timestamp;
-					for (const block of entry.message.content) {
+			if (entryMsg?.role === "assistant") {
+				if (targetToolEntryIds.length > 0 && Array.isArray(entryMsg.content)) {
+					pairedAssistantEntryId = entryId;
+					pairedAssistantTimestamp = entryMsg.timestamp;
+					for (const block of entryMsg.content) {
 						if (block?.type === "toolCall" && typeof block.id === "string") {
 							state.blockedToolCallIds.add(block.id);
 						}
@@ -257,7 +260,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 				}
 				break;
 			}
-			if (entry?.type === "message" && entry.message?.role === "user") {
+			if (entryMsg?.role === "user") {
 				break;
 			}
 		}
@@ -270,10 +273,38 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 			for (const tid of targetToolEntryIds) {
 				edits.push({ type: "context_edit", targetId: tid, replacement: null });
 			}
+		}
+
+		// Also compact any older active large toolResult entries (e.g. an earlier `read`
+		// of a long reference doc whose cumulative WAF anomaly score triggered 403 once earlier
+		// messages were compacted into Akamai's inspection buffer).
+		const droppedToolIds = new Set(targetToolEntryIds);
+		for (let i = activeEntries.length - 1; i >= 0; i--) {
+			const pe = activeEntries[i];
+			const entryId = pe.sourceEntry?.id;
+			const entryMsg: any = pe.messages[0];
+			if (entryMsg?.role !== "toolResult") continue;
+			if (entryId && droppedToolIds.has(entryId)) continue;
+			const textLen = (entryMsg.content ?? [])
+				.filter((b: any) => b?.type === "text")
+				.reduce((acc: number, b: any) => acc + String(b.text ?? "").length, 0);
+			if (textLen > 400) {
+				const trId = entryMsg.toolCallId as string | undefined;
+				const replacement = `[Tool result (${entryMsg.toolName ?? "tool"}, ${textLen} chars) compacted after ${diagnosis.summary}. Re-read smaller targeted ranges if needed.]`;
+				if (trId) {
+					state.replacedToolResults.set(trId, replacement);
+				}
+				if (entryId) {
+					edits.push({ type: "context_edit", targetId: entryId, replacement: { content: replacement } });
+				}
+			}
+		}
+
+		if (pairedAssistantEntryId && targetToolEntryIds.length > 0) {
 			edits.push({
 				type: "custom_message",
 				customType: "hkbu-genai-recovery",
-				content: `[hkbu-genai recovery] Removed the preceding tool turn from conversation context after ${diagnosis.summary}. Local logs remain saved under ${logDir}. Continue using single commands or read/ls/find/grep tools.`,
+				content: `[hkbu-genai recovery] Removed the preceding tool turn and compacted large historical tool outputs after ${diagnosis.summary}. Local logs remain saved under ${logDir}. Continue using single commands, smaller read ranges (<=80 lines), or structured tools.`,
 				display: true,
 			});
 		}

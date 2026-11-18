@@ -446,13 +446,23 @@ export function sanitizeProviderPayload(payload: unknown, fallbackModelId = ""):
 		}
 	}
 
-	// 5. Clean empty user text arrays or empty assistant stubs
+	// 5. Clean empty user text arrays, empty assistant stubs, and orphaned tool messages
+	const activeToolCallIds = new Set<string>();
 	p.messages = p.messages.filter((msg: any) => {
 		if (!msg || typeof msg !== "object") return false;
 		if (msg.role === "assistant") {
 			const hasTools = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
 			const hasContent = extractToolText(msg.content).trim().length > 0;
 			if (!hasTools && !hasContent) return false;
+			if (hasTools) {
+				for (const tc of msg.tool_calls) {
+					if (typeof tc?.id === "string") activeToolCallIds.add(tc.id);
+				}
+			}
+		} else if (msg.role === "tool") {
+			if (typeof msg.tool_call_id !== "string" || !activeToolCallIds.has(msg.tool_call_id)) {
+				return false;
+			}
 		}
 		return true;
 	});
@@ -486,8 +496,8 @@ export function compactMessagesForBudget(
 	state: CompactionState,
 	options: CompactionOptions = {},
 ): { messages: any[]; changed: boolean } {
-	const keepRecent = options.keepRecentToolResults ?? 4;
-	const olderMaxChars = options.olderToolResultMaxChars ?? 1200;
+	const keepRecent = options.keepRecentToolResults ?? 2;
+	const olderMaxChars = options.olderToolResultMaxChars ?? 600;
 	const maxTotalChars = options.maxTotalContextChars ?? 160_000;
 
 	let changed = false;
@@ -548,16 +558,38 @@ export function compactMessagesForBudget(
 		cleaned.push(msg);
 	}
 
+	// Drop orphaned toolResult messages whose paired assistant toolCall was omitted or removed
+	const validToolCallIds = new Set<string>();
+	const pairedCleaned: any[] = [];
+	for (const msg of cleaned) {
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			for (const b of msg.content) {
+				if (b?.type === "toolCall" && typeof b.id === "string") {
+					validToolCallIds.add(b.id);
+				}
+			}
+			pairedCleaned.push(msg);
+		} else if (msg.role === "toolResult") {
+			if (!validToolCallIds.has(msg.toolCallId)) {
+				changed = true;
+				continue;
+			}
+			pairedCleaned.push(msg);
+		} else {
+			pairedCleaned.push(msg);
+		}
+	}
+
 	// Compact older toolResults beyond the most recent `keepRecent`
 	const toolResultIndices: number[] = [];
-	for (let i = 0; i < cleaned.length; i++) {
-		if (cleaned[i]?.role === "toolResult") {
+	for (let i = 0; i < pairedCleaned.length; i++) {
+		if (pairedCleaned[i]?.role === "toolResult") {
 			toolResultIndices.push(i);
 		}
 	}
 
 	const cutoff = Math.max(0, toolResultIndices.length - keepRecent);
-	const result = cleaned.map((m) => m);
+	const result = pairedCleaned.map((m) => m);
 
 	for (let k = 0; k < cutoff; k++) {
 		const idx = toolResultIndices[k];

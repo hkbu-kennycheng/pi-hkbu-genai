@@ -284,15 +284,17 @@ What the extension configures and guards against:
 1. **Uses `/chat/completions` (`openai-completions`) instead of `/responses` (`openai-responses`):**
    - Akamai WAF blocks shell commands/code inside `/responses` `function_call_output.output` and string `input`, whereas `/chat/completions` `messages[*].content` (including `role: "tool"`) allows standard command outputs.
    - Avoids `"OpenAI Responses stream ended before a terminal response event"`.
-2. **Prevents `403` from `tool_calls[].function.arguments` and long command outputs:**
+2. **Prevents `403` from `tool_calls[].function.arguments` and large tool outputs / doc reads:**
    - Steers the agent toward structured tools (`read`, `ls`, `find`, `grep`, `edit`, `write`) and single commands per `bash` call, blocking `;`, `&&`, `||`, `<script`, `eval(`, and `alert(` inside `bash` tool arguments before execution.
-   - Strips ANSI codes, caps command output (`12 KB` / `180` lines) and `read` chunks (`24 KB` / `400` lines), saves full logs locally under `/tmp/pi-hkbu-genai/`, and transparently omits command-log lines containing `<script`, `eval(`, or `alert(`.
-   - Automatically unbricks sessions on `403`/`400` via `turn_end` `context_edit` + `context` cleanup.
+   - Strips ANSI codes, caps command output (`12 KB` / `180` lines) and `read` chunks (`6 KB` / `80` lines, advising range reads for larger files), saves full logs locally under `/tmp/pi-hkbu-genai/`, and transparently omits command-log lines containing `<script`, `eval(`, or `alert(`.
+   - Automatically unbricks sessions on `403`/`400` via `turn_end` `context_edit` + `context` cleanup across active projected entries (`event.context.contextEntries`), compacting older large `toolResult` entries and never un-omitting previously omitted entries.
 3. **Prevents `400` errors across all 13 chat models:**
    - Sets `supportsStrictMode: false`, `supportsOpenAIGrammarTools: false`, `supportsMidConvoSystemMessages: false`, `promptCacheKeyMode: "disabled"`, and strips `strict` from function tool schemas (`400 'additionalProperties' is required`).
    - Enforces a `max_completion_tokens` floor of `256` and deletes `content-encoding` headers (`gzip` requests fail with `400`).
    - Normalizes cross-model `tool_calls` when switching models mid-session (shortens Gemini's ~600-char `call_gctx_v1_...` IDs for Azure/GPT models to prevent `400 string too long`, and folds non-Gemini `tool_calls` to text for Gemini models to prevent `400 missing a thought_signature`).
-   - Compacts older `toolResult` messages in `context` to stay within budget during long-running sessions.
+   - Keeps only the 2 most recent `toolResult` messages verbatim (`keepRecentToolResults: 2`), compacts older `toolResult` messages (`600` chars) to avoid cumulative WAF scoring shifts and budget overruns, and drops orphaned `toolResult` / `tool_calls` entries so `403`/`400` recovery never causes `No tool call found for function call output`.
+
+> **Tip for Computer Use (Paseo / Pi):** If you use `open-computer-use`, configure it as a local stdio MCP server (`"open-computer-use": { "command": "open-computer-use", "args": ["mcp"] }`) inside `~/.pi/agent/mcp.json`. Giving Pi direct MCP tools avoids falling back to CLI/JS-REPL docs (`usage.md`), which otherwise pull large code-heavy documentation into conversation history.
 
 ---
 

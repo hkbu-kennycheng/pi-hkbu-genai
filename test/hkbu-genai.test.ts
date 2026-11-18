@@ -98,6 +98,16 @@ test("sanitizeProviderPayload fixes strict, token floor, cache fields, and cross
 	assert.ok(mappedId.length <= 40);
 	assert.equal(sanitized.messages[2].tool_call_id, mappedId);
 
+	// Drops orphaned tool messages with no matching assistant tool_call
+	const withOrphan = sanitizeProviderPayload({
+		model: "gpt-6.1-terra",
+		messages: [
+			{ role: "user", content: "hi" },
+			{ role: "tool", tool_call_id: "call_orphan", content: "stale" },
+		],
+	}) as any;
+	assert.equal(withOrphan.messages.length, 1);
+
 	// Switching from non-Gemini tool call to Gemini model folds foreign tool_calls to text
 	const toGemini = sanitizeProviderPayload({
 		model: "gemini-3.8-flash",
@@ -117,12 +127,32 @@ test("sanitizeProviderPayload fixes strict, token floor, cache fields, and cross
 	assert.ok(toGemini.messages[2].content.includes("README.md"));
 });
 
-test("compactMessagesForBudget strips blocked/errored entries and compacts older toolResults", () => {
+test("compactMessagesForBudget strips blocked/errored/orphaned entries and compacts older toolResults", () => {
 	const state: CompactionState = {
 		blockedToolCallIds: new Set(["tc_blocked"]),
 		droppedMessageTimestamps: new Set([999]),
 		replacedToolResults: new Map([["tc_403", "[Tool result removed]"]]),
 	};
+	const toolTurns = Array.from({ length: 6 }, (_, i) => {
+		const id = i === 5 ? "tc_403" : `tc_${i}`;
+		return [
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id, name: "bash", arguments: { command: "echo ok" } }],
+				stopReason: "toolUse",
+				timestamp: 200 + i * 2,
+			},
+			{
+				role: "toolResult",
+				toolCallId: id,
+				toolName: "bash",
+				content: [{ type: "text", text: "X".repeat(2500) }],
+				isError: false,
+				timestamp: 201 + i * 2,
+			},
+		];
+	}).flat();
+
 	const messages = [
 		{ role: "user", content: [{ type: "text", text: "go" }] },
 		{
@@ -139,14 +169,15 @@ test("compactMessagesForBudget strips blocked/errored entries and compacts older
 			isError: true,
 			timestamp: 101,
 		},
-		...Array.from({ length: 6 }, (_, i) => ({
+		{
 			role: "toolResult",
-			toolCallId: i === 5 ? "tc_403" : `tc_${i}`,
+			toolCallId: "tc_orphan_missing_assistant",
 			toolName: "bash",
-			content: [{ type: "text", text: "X".repeat(2500) }],
+			content: [{ type: "text", text: "orphaned output" }],
 			isError: false,
-			timestamp: 200 + i,
-		})),
+			timestamp: 150,
+		},
+		...toolTurns,
 		{ role: "assistant", content: [], stopReason: "error", errorMessage: "403", timestamp: 999 },
 	];
 
@@ -159,8 +190,10 @@ test("compactMessagesForBudget strips blocked/errored entries and compacts older
 	assert.equal(out[1].content[0].type, "text");
 	// Blocked toolResult converted to plain user notice
 	assert.equal(out[2].role, "user");
+	// Orphaned toolResult dropped
+	assert.equal(out.some((m) => m.toolCallId === "tc_orphan_missing_assistant"), false);
 	// Older toolResults compacted while recent ones kept (except tc_403 replaced)
-	assert.ok(out[3].content[0].text.includes("compacted"));
+	assert.ok(out[4].content[0].text.includes("compacted"));
 	assert.equal(out[out.length - 1].content[0].text, "[Tool result removed]");
 	assert.equal(out.some((m) => m.stopReason === "error"), false);
 });
