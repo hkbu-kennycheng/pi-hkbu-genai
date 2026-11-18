@@ -278,15 +278,15 @@ export function sanitizeToolOutputText(rawText: string, options: SanitizeOutputO
 	if (truncatedRes.truncated || redactedCount > 0) {
 		const notes: string[] = [];
 		if (truncatedRes.truncated) {
-			notes.push(`truncated from ${Buffer.byteLength(working, "utf8")} bytes / ${working.split("\n").length} lines`);
+			notes.push(`truncated from ${Buffer.byteLength(working, "utf8")}B / ${working.split("\n").length}L`);
 		}
 		if (redactedCount > 0) {
-			notes.push(`${redactedCount} line(s) omitted by HKBU WAF guard`);
+			notes.push(`${redactedCount} WAF lines omitted`);
 		}
 		if (options.spilloverPath) {
-			notes.push(`full raw output saved to ${options.spilloverPath} (use read with offset/limit to inspect)`);
+			notes.push(`full log at ${options.spilloverPath}`);
 		}
-		finalText += `\n\n[hkbu-genai output notice: ${notes.join("; ")}]`;
+		finalText += `\n\n[hkbu-genai ${notes.join(", ")}]`;
 	}
 
 	return {
@@ -513,7 +513,7 @@ export function compactMessagesForBudget(
 ): { messages: any[]; changed: boolean } {
 	const keepRecent = options.keepRecentToolResults ?? 2;
 	const olderMaxChars = options.olderToolResultMaxChars ?? 600;
-	const recentBudgetChars = options.recentToolResultBudgetChars ?? 7500;
+	const recentBudgetChars = options.recentToolResultBudgetChars ?? 6500;
 	const maxTotalChars = options.maxTotalContextChars ?? 160_000;
 
 	let changed = false;

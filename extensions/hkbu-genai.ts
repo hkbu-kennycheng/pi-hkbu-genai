@@ -17,14 +17,14 @@ import {
 	type HkbuModelCatalogEntry,
 } from "../lib/hkbu-genai-helpers.ts";
 
-const BASH_MAX_BYTES = 8 * 1024;
-const BASH_MAX_LINES = 140;
-const CODEMODE_MAX_BYTES = 4 * 1024;
-const CODEMODE_MAX_LINES = 60;
-const READ_MAX_BYTES = 6 * 1024;
-const READ_MAX_LINES = 80;
-const OTHER_TOOL_MAX_BYTES = 6 * 1024;
-const OTHER_TOOL_MAX_LINES = 120;
+const BASH_MAX_BYTES = 6 * 1024;
+const BASH_MAX_LINES = 100;
+const CODEMODE_MAX_BYTES = 3584;
+const CODEMODE_MAX_LINES = 45;
+const READ_MAX_BYTES = 3584;
+const READ_MAX_LINES = 36;
+const OTHER_TOOL_MAX_BYTES = 5 * 1024;
+const OTHER_TOOL_MAX_LINES = 90;
 
 function getToolOutputLimits(toolName: string): { maxBytes: number; maxLines: number; redactWafTriggers: boolean } {
 	switch (toolName) {
@@ -144,10 +144,10 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 				event.systemPrompt +
 				`\n\n[HKBU GenAI Gateway Rules]
 - Prefer calling structured tools (read, ls, find, grep, edit, write) and direct MCP tools directly rather than wrapping tools.read or verbose JSON.stringify dumps inside codemode.
-- When using read on docs or code files, read small targeted ranges (offset/limit of ~80 lines) rather than loading long files at once.
+- When using read on docs or code files, read small targeted ranges (offset/limit of ~30 lines) rather than loading long files at once.
 - When using bash, run ONE simple command per call (no shell chaining operators like semicolon, double-ampersand, or double-pipe in bash arguments). If multiple steps are needed, make separate bash tool calls or write a script file with write and execute it.
 - Never embed HTML script tags, eval calls, or alert calls inside bash or codemode arguments.
-- Keep command and codemode outputs concise (< 4 KB) instead of dumping raw file contents or full accessibility trees.`,
+- Keep command and codemode outputs concise (< 3.5 KB) instead of dumping raw file contents or full accessibility trees.`,
 		};
 	});
 
