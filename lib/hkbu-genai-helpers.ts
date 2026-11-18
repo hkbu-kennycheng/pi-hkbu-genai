@@ -479,12 +479,27 @@ export interface CompactionState {
 export interface CompactionOptions {
 	keepRecentToolResults?: number;
 	olderToolResultMaxChars?: number;
+	recentToolResultBudgetChars?: number;
 	maxTotalContextChars?: number;
 }
 
 function estimateMessageChars(msg: any): number {
 	if (!msg) return 0;
 	return JSON.stringify(msg).length;
+}
+
+function buildCompactedToolResult(tr: any, text: string, maxChars: number, reasonNote: string) {
+	const head = text.slice(0, Math.floor(maxChars * 0.45));
+	const tail = text.slice(-Math.floor(maxChars * 0.35));
+	return {
+		...tr,
+		content: [
+			{
+				type: "text",
+				text: `${head}\n\n... [${reasonNote}: compacted from ${text.length} chars] ...\n\n${tail}`,
+			},
+		],
+	};
 }
 
 /**
@@ -498,6 +513,7 @@ export function compactMessagesForBudget(
 ): { messages: any[]; changed: boolean } {
 	const keepRecent = options.keepRecentToolResults ?? 2;
 	const olderMaxChars = options.olderToolResultMaxChars ?? 600;
+	const recentBudgetChars = options.recentToolResultBudgetChars ?? 7500;
 	const maxTotalChars = options.maxTotalContextChars ?? 160_000;
 
 	let changed = false;
@@ -597,17 +613,26 @@ export function compactMessagesForBudget(
 		const text = extractToolText(tr.content);
 		if (text.length > olderMaxChars) {
 			changed = true;
-			const head = text.slice(0, Math.floor(olderMaxChars * 0.45));
-			const tail = text.slice(-Math.floor(olderMaxChars * 0.35));
-			result[idx] = {
-				...tr,
-				content: [
-					{
-						type: "text",
-						text: `${head}\n\n... [older toolResult compacted from ${text.length} chars for long-running context budget] ...\n\n${tail}`,
-					},
-				],
-			};
+			result[idx] = buildCompactedToolResult(tr, text, olderMaxChars, "older toolResult");
+		}
+	}
+
+	// Keep the latest toolResult verbatim; compact any earlier kept-window toolResult if
+	// their combined size would exceed recentBudgetChars (prevents cumulative WAF 403s).
+	if (toolResultIndices.length > 0 && recentBudgetChars > 0) {
+		const newestIdx = toolResultIndices[toolResultIndices.length - 1];
+		let runningRecentChars = extractToolText(result[newestIdx].content).length;
+		for (let k = toolResultIndices.length - 2; k >= cutoff; k--) {
+			const idx = toolResultIndices[k];
+			const tr = result[idx];
+			const text = extractToolText(tr.content);
+			if (text.length > olderMaxChars && runningRecentChars + text.length > recentBudgetChars) {
+				changed = true;
+				result[idx] = buildCompactedToolResult(tr, text, olderMaxChars, "recent toolResult budget");
+				runningRecentChars += extractToolText(result[idx].content).length;
+			} else {
+				runningRecentChars += text.length;
+			}
 		}
 	}
 

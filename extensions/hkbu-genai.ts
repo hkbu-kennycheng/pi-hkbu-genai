@@ -17,10 +17,31 @@ import {
 	type HkbuModelCatalogEntry,
 } from "../lib/hkbu-genai-helpers.ts";
 
-const BASH_MAX_BYTES = 12 * 1024;
-const BASH_MAX_LINES = 180;
+const BASH_MAX_BYTES = 8 * 1024;
+const BASH_MAX_LINES = 140;
+const CODEMODE_MAX_BYTES = 4 * 1024;
+const CODEMODE_MAX_LINES = 60;
 const READ_MAX_BYTES = 6 * 1024;
 const READ_MAX_LINES = 80;
+const OTHER_TOOL_MAX_BYTES = 6 * 1024;
+const OTHER_TOOL_MAX_LINES = 120;
+
+function getToolOutputLimits(toolName: string): { maxBytes: number; maxLines: number; redactWafTriggers: boolean } {
+	switch (toolName) {
+		case "codemode":
+			return { maxBytes: CODEMODE_MAX_BYTES, maxLines: CODEMODE_MAX_LINES, redactWafTriggers: true };
+		case "bash":
+			return { maxBytes: BASH_MAX_BYTES, maxLines: BASH_MAX_LINES, redactWafTriggers: true };
+		case "read":
+			return { maxBytes: READ_MAX_BYTES, maxLines: READ_MAX_LINES, redactWafTriggers: false };
+		default:
+			return {
+				maxBytes: OTHER_TOOL_MAX_BYTES,
+				maxLines: OTHER_TOOL_MAX_LINES,
+				redactWafTriggers: toolName.startsWith("mcp__"),
+			};
+	}
+}
 
 export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 	const logDir = join(tmpdir(), "pi-hkbu-genai", String(process.pid));
@@ -122,11 +143,11 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 			systemPrompt:
 				event.systemPrompt +
 				`\n\n[HKBU GenAI Gateway Rules]
-- Prefer structured built-in tools (read, ls, find, grep, edit, write) over bash or codemode for file inspection and edits.
+- Prefer calling structured tools (read, ls, find, grep, edit, write) and direct MCP tools directly rather than wrapping tools.read or verbose JSON.stringify dumps inside codemode.
 - When using read on docs or code files, read small targeted ranges (offset/limit of ~80 lines) rather than loading long files at once.
 - When using bash, run ONE simple command per call (no shell chaining operators like semicolon, double-ampersand, or double-pipe in bash arguments). If multiple steps are needed, make separate bash tool calls or write a script file with write and execute it.
-- Never embed HTML script tags, eval calls, or alert calls inside bash tool command arguments.
-- Keep command outputs concise instead of dumping massive unfiltered logs.`,
+- Never embed HTML script tags, eval calls, or alert calls inside bash or codemode arguments.
+- Keep command and codemode outputs concise (< 4 KB) instead of dumping raw file contents or full accessibility trees.`,
 		};
 	});
 
@@ -145,33 +166,31 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	// 3. Bound long command outputs & redact lines matching Akamai 403 WP signatures
+	// 3. Bound long tool/MCP outputs & redact lines matching Akamai 403 WP signatures
 	pi.on("tool_result", async (event, ctx) => {
 		if (!isHkbuEndpointModel(ctx.model)) return undefined;
-		if (!["bash", "codemode", "read"].includes(event.toolName)) return undefined;
 
 		const textBlocks = event.content.filter((b): b is { type: "text"; text: string } => b.type === "text");
 		if (textBlocks.length === 0) return undefined;
 
 		const combined = textBlocks.map((b) => b.text).join("\n");
-		const isCommand = event.toolName === "bash" || event.toolName === "codemode";
-		const maxBytes = isCommand ? BASH_MAX_BYTES : READ_MAX_BYTES;
-		const maxLines = isCommand ? BASH_MAX_LINES : READ_MAX_LINES;
+		const { maxBytes, maxLines, redactWafTriggers } = getToolOutputLimits(event.toolName);
 
 		// Pre-check if output needs spillover saving before constructing notice
 		const probe = sanitizeToolOutputText(combined, {
 			maxBytes,
 			maxLines,
-			redactWafTriggers: isCommand,
+			redactWafTriggers,
 		});
 
 		if (!probe.modified) return undefined;
 
-		const spilloverPath = saveSpillover(event.toolName, probe.rawCleanText);
+		const safeToolLabel = event.toolName.replace(/[^a-zA-Z0-9_-]+/g, "_");
+		const spilloverPath = saveSpillover(safeToolLabel, probe.rawCleanText);
 		const finalRes = sanitizeToolOutputText(combined, {
 			maxBytes,
 			maxLines,
-			redactWafTriggers: isCommand,
+			redactWafTriggers,
 			spilloverPath,
 		});
 

@@ -196,6 +196,35 @@ test("compactMessagesForBudget strips blocked/errored/orphaned entries and compa
 	assert.ok(out[4].content[0].text.includes("compacted"));
 	assert.equal(out[out.length - 1].content[0].text, "[Tool result removed]");
 	assert.equal(out.some((m) => m.stopReason === "error"), false);
+
+	// Combined recent budget compacts -2 when -1 + -2 exceed recentToolResultBudgetChars
+	const recentPairState: CompactionState = {
+		blockedToolCallIds: new Set(),
+		droppedMessageTimestamps: new Set(),
+		replacedToolResults: new Map(),
+	};
+	const pairRes = compactMessagesForBudget(
+		[
+			{ role: "user", content: [{ type: "text", text: "go" }] },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "r1", name: "read", arguments: {} }],
+				timestamp: 1,
+			},
+			{ role: "toolResult", toolCallId: "r1", toolName: "read", content: [{ type: "text", text: "A".repeat(4500) }], timestamp: 2 },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "r2", name: "read", arguments: {} }],
+				timestamp: 3,
+			},
+			{ role: "toolResult", toolCallId: "r2", toolName: "read", content: [{ type: "text", text: "B".repeat(4500) }], timestamp: 4 },
+		],
+		recentPairState,
+		{ keepRecentToolResults: 2, olderToolResultMaxChars: 500, recentToolResultBudgetChars: 7500 },
+	);
+	assert.equal(pairRes.changed, true);
+	assert.ok(pairRes.messages[2].content[0].text.includes("compacted from 4500 chars"));
+	assert.equal(pairRes.messages[4].content[0].text, "B".repeat(4500));
 });
 
 test("diagnoseProviderError extracts Akamai reference code and 400 reason", () => {
