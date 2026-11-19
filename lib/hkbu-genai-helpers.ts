@@ -805,6 +805,7 @@ export function compactMessagesForBudget(
 }
 
 export interface RateLimitDetails {
+	type?: string;
 	code?: string;
 	message?: string;
 	model?: string;
@@ -814,6 +815,8 @@ export interface RateLimitDetails {
 	remaining?: number;
 	retryAfterSeconds?: number;
 	resetAt?: string;
+	currency?: string;
+	quotaUsedPercentThreshold?: number;
 }
 
 export interface ErrorDiagnosis {
@@ -872,6 +875,7 @@ export function parseRateLimitErrorDetails(
 	if (!obj && retryAfterSeconds === undefined) return undefined;
 
 	const details: RateLimitDetails = {
+		type: typeof obj?.type === "string" ? obj.type : undefined,
 		code: typeof obj?.code === "string" ? obj.code : undefined,
 		message: typeof obj?.message === "string" ? obj.message : undefined,
 		model: typeof obj?.model === "string" ? obj.model : undefined,
@@ -881,12 +885,23 @@ export function parseRateLimitErrorDetails(
 		remaining: typeof obj?.remaining === "number" ? obj.remaining : undefined,
 		retryAfterSeconds,
 		resetAt: typeof obj?.resetAt === "string" ? obj.resetAt : undefined,
+		currency: typeof obj?.currency === "string" ? obj.currency : undefined,
+		quotaUsedPercentThreshold:
+			typeof obj?.quota_used_percent_threshold === "number" ? obj.quota_used_percent_threshold : undefined,
 	};
 	return details;
 }
 
+export function isAccountCostQuotaExceeded(details: RateLimitDetails | undefined): boolean {
+	if (!details) return false;
+	if (details.code === "COST_QUOTA_EXCEEDED" || details.type === "quota_exceeded") return true;
+	if (details.quotaUsedPercentThreshold !== undefined && details.quotaUsedPercentThreshold >= 100) return true;
+	return /monthly api cost quota exceeded|cost quota exceeded/i.test(details.message ?? "");
+}
+
 export function isHardQuotaExhausted(details: RateLimitDetails | undefined): boolean {
 	if (!details) return false;
+	if (isAccountCostQuotaExceeded(details) || details.code === "MODEL_DAILY_QUOTA_EXHAUSTED") return true;
 	return (
 		details.limit !== undefined &&
 		details.remaining === 0 &&
@@ -932,6 +947,8 @@ export function diagnoseProviderError(errorMessage: string | undefined): ErrorDi
 	if (
 		/(?<![a-z0-9])429(?![a-z0-9])/.test(errorMessage) ||
 		errorMessage.includes("rate_limit_error") ||
+		errorMessage.includes("quota_exceeded") ||
+		errorMessage.includes("COST_QUOTA_EXCEEDED") ||
 		errorMessage.includes("MODEL_DAILY_QUOTA")
 	) {
 		const rateLimit = parseRateLimitErrorDetails(errorMessage);
@@ -942,13 +959,18 @@ export function diagnoseProviderError(errorMessage: string | undefined): ErrorDi
 		}
 		if (rateLimit?.reserved !== undefined) statsParts.push(`reserved=${rateLimit.reserved}`);
 		if (rateLimit?.remaining !== undefined) statsParts.push(`remaining=${rateLimit.remaining}`);
+		if (rateLimit?.quotaUsedPercentThreshold !== undefined) {
+			statsParts.push(`used=${rateLimit.quotaUsedPercentThreshold}%`);
+		}
 		if (rateLimit?.retryAfterSeconds !== undefined) statsParts.push(`retryAfter=${rateLimit.retryAfterSeconds}s`);
 		if (rateLimit?.resetAt) statsParts.push(`resetAt=${rateLimit.resetAt}`);
 		const modelLabel = rateLimit?.model ? ` on ${rateLimit.model}` : "";
 		const detailSuffix = statsParts.length > 0 ? ` (${statsParts.join(", ")})` : "";
-		const advice = isHardQuotaExhausted(rateLimit)
-			? "Daily prompt quota exhausted; switch to gpt-6.1-terra, gpt-6.1-sol, or gpt-6-luna."
-			: "In-flight/rate quota slots are saturated on this model; wait for server reservations to clear or switch to gpt-6.1-terra, gpt-6.1-sol, or gpt-6-luna.";
+		const advice = isAccountCostQuotaExceeded(rateLimit)
+			? "Monthly API cost quota exceeded for this HKBU key across all models; switch to another configured provider (e.g. openrouter, litellm) or replace HKBU_GENAI_API_KEY."
+			: isHardQuotaExhausted(rateLimit)
+				? "Daily prompt quota exhausted; switch to gpt-6.1-terra, gpt-6.1-sol, or gpt-6-luna."
+				: "In-flight/rate quota slots are saturated on this model; wait for server reservations to clear or switch to gpt-6.1-terra, gpt-6.1-sol, or gpt-6-luna.";
 		return {
 			kind: "rate_limit_429",
 			rateLimit,

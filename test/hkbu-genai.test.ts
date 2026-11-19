@@ -5,6 +5,7 @@ import {
 	compactMessagesForBudget,
 	computeHkbu429RetryDelayMs,
 	diagnoseProviderError,
+	isAccountCostQuotaExceeded,
 	isHardQuotaExhausted,
 	isHkbuEndpointModel,
 	isTransientStreamError,
@@ -390,6 +391,21 @@ test("diagnoseProviderError classifies 429 quota errors and suggests fallback mo
 	);
 	assert.equal(d429Hard.kind, "rate_limit_429");
 	assert.ok(d429Hard.summary.includes("Daily prompt quota exhausted"));
+
+	const costRaw =
+		'429: {"message":"Monthly API cost quota exceeded.","type":"quota_exceeded","param":null,"code":"COST_QUOTA_EXCEEDED","currency":"HKD","unit":"nano_hkd","quota_used_percent_threshold":100}';
+	const costDetails = parseRateLimitErrorDetails(costRaw);
+	assert.equal(isAccountCostQuotaExceeded(costDetails), true);
+	assert.equal(isHardQuotaExhausted(costDetails), true);
+	assert.equal(computeHkbu429RetryDelayMs(costDetails, 1, 20_000), null);
+
+	const d429Cost = diagnoseProviderError(costRaw);
+	assert.equal(d429Cost.kind, "rate_limit_429");
+	assert.equal(d429Cost.rateLimit?.code, "COST_QUOTA_EXCEEDED");
+	assert.equal(d429Cost.rateLimit?.quotaUsedPercentThreshold, 100);
+	assert.ok(d429Cost.summary.includes("Monthly API cost quota exceeded"));
+	assert.ok(d429Cost.summary.includes("used=100%"));
+	assert.equal(d429Cost.summary.includes("switch to gpt-6.1-terra"), false);
 });
 
 test("isTransientStreamError, normalizeTransientStreamErrorMessage, and diagnoseProviderError handle stream drops", () => {
