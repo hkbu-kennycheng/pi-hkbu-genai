@@ -817,11 +817,25 @@ export interface RateLimitDetails {
 }
 
 export interface ErrorDiagnosis {
-	kind: "akamai_403" | "http_400" | "rate_limit_429" | "other";
+	kind: "akamai_403" | "http_400" | "rate_limit_429" | "stream_error" | "other";
 	summary: string;
 	referenceCode?: string;
 	deniedReason?: string;
 	rateLimit?: RateLimitDetails;
+}
+
+export const TRANSIENT_STREAM_ERROR_RE =
+	/stream ended before completion|stream ended without|other side closed|socket hang up|(?<![a-z0-9])terminated(?![a-z0-9])|econnreset|etimedout|epipe|unable to forward upstream|upstream(?:\s+connect|\s+error)|bad gateway|(?<![a-z0-9])(?:502|503|504)(?![a-z0-9])/i;
+
+export function isTransientStreamError(errorMessage: string | undefined): boolean {
+	return Boolean(errorMessage && TRANSIENT_STREAM_ERROR_RE.test(errorMessage));
+}
+
+export function normalizeTransientStreamErrorMessage(errorMessage: string): string {
+	if (/stream ended before completion/i.test(errorMessage) && !/ended without/i.test(errorMessage)) {
+		return `${errorMessage} (stream ended without completion)`;
+	}
+	return errorMessage;
 }
 
 export function parseRateLimitErrorDetails(
@@ -946,6 +960,13 @@ export function diagnoseProviderError(errorMessage: string | undefined): ErrorDi
 		return {
 			kind: "http_400",
 			summary: `HTTP 400 from HKBU backend: ${errorMessage.slice(0, 240)}`,
+		};
+	}
+
+	if (isTransientStreamError(errorMessage)) {
+		return {
+			kind: "stream_error",
+			summary: `HKBU upstream stream dropped before completion (${errorMessage.slice(0, 180)}). Retry or switch to gpt-6.1-terra / gpt-6-luna.`,
 		};
 	}
 

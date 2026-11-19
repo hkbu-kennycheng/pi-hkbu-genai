@@ -7,6 +7,8 @@ import {
 	diagnoseProviderError,
 	isHardQuotaExhausted,
 	isHkbuEndpointModel,
+	isTransientStreamError,
+	normalizeTransientStreamErrorMessage,
 	parseRateLimitErrorDetails,
 	sanitizeProviderPayload,
 	sanitizeToolOutputText,
@@ -388,4 +390,28 @@ test("diagnoseProviderError classifies 429 quota errors and suggests fallback mo
 	);
 	assert.equal(d429Hard.kind, "rate_limit_429");
 	assert.ok(d429Hard.summary.includes("Daily prompt quota exhausted"));
+});
+
+test("isTransientStreamError, normalizeTransientStreamErrorMessage, and diagnoseProviderError handle stream drops", () => {
+	assert.equal(isTransientStreamError("Provider stream ended before completion."), true);
+	assert.equal(isTransientStreamError("Stream ended without finish_reason"), true);
+	assert.equal(isTransientStreamError("SocketError: other side closed"), true);
+	assert.equal(isTransientStreamError("TypeError: terminated"), true);
+	assert.equal(isTransientStreamError("502 Bad Gateway"), true);
+	assert.equal(isTransientStreamError("invalid_api_key"), false);
+	assert.equal(isTransientStreamError("port 15023 failed"), false);
+
+	assert.equal(
+		normalizeTransientStreamErrorMessage("Provider stream ended before completion."),
+		"Provider stream ended before completion. (stream ended without completion)",
+	);
+	assert.equal(
+		normalizeTransientStreamErrorMessage("Stream ended without finish_reason"),
+		"Stream ended without finish_reason",
+	);
+
+	const dStream = diagnoseProviderError("Provider stream ended before completion.");
+	assert.equal(dStream.kind, "stream_error");
+	assert.ok(dStream.summary.includes("stream dropped"));
+	assert.ok(dStream.summary.includes("gpt-6.1-terra"));
 });

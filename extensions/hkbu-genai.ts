@@ -21,6 +21,8 @@ import {
 	HKBU_PROVIDER_ID,
 	isHkbuEndpointModel,
 	isSuspectToolCallArgs,
+	isTransientStreamError,
+	normalizeTransientStreamErrorMessage,
 	parseRateLimitErrorDetails,
 	sanitizeProviderPayload,
 	sanitizeToolOutputText,
@@ -55,6 +57,7 @@ function getToolOutputLimits(toolName: string): { maxBytes: number; maxLines: nu
 }
 
 const MAX_429_RETRY_WAIT_MS = 20_000;
+const MAX_TRANSIENT_STREAM_RETRIES = 2;
 const modelRequestQueues = new Map<string, Promise<void>>();
 
 function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
@@ -163,18 +166,111 @@ function hkbuStreamSimple(model: Model<Api>, context: TranscriptContext, options
 				return retryRequest ? baseFetch(retryRequest, init) : baseFetch(input, init);
 			};
 
-			const innerStream = openAICompletionsApi().streamSimple(
-				model as Model<"openai-completions">,
-				context,
-				{
-					...options,
-					fetch: wrappedFetch,
-				},
-			);
+			for (let attempt = 0; attempt <= MAX_TRANSIENT_STREAM_RETRIES; attempt++) {
+				let pendingStart: any;
+				let hasStreamedContent = false;
+				let retryWaitMs: number | undefined;
 
-			for await (const event of innerStream) {
-				if (event.type === "error") emittedError = true;
-				outStream.push(event);
+				try {
+					const innerStream = openAICompletionsApi().streamSimple(
+						model as Model<"openai-completions">,
+						context,
+						{
+							...options,
+							fetch: wrappedFetch,
+						},
+					);
+
+					for await (const event of innerStream) {
+						if (event.type === "start") {
+							if (!hasStreamedContent) {
+								pendingStart = event;
+								continue;
+							}
+						}
+
+						if (event.type === "error") {
+							const errMsg = event.error?.errorMessage ?? "";
+							if (
+								!hasStreamedContent &&
+								attempt < MAX_TRANSIENT_STREAM_RETRIES &&
+								!options?.signal?.aborted &&
+								event.reason !== "aborted" &&
+								isTransientStreamError(errMsg)
+							) {
+								retryWaitMs = 1_500 * (attempt + 1);
+								break;
+							}
+
+							const hadRealContent = hasStreamedContent;
+							if (pendingStart) {
+								outStream.push(pendingStart);
+								pendingStart = undefined;
+								hasStreamedContent = true;
+							}
+							emittedError = true;
+							if (hadRealContent && isTransientStreamError(errMsg) && event.error) {
+								outStream.push({
+									...event,
+									error: {
+										...event.error,
+										errorMessage: normalizeTransientStreamErrorMessage(errMsg),
+									},
+								});
+							} else {
+								outStream.push(event);
+							}
+							return;
+						}
+
+						if (pendingStart) {
+							outStream.push(pendingStart);
+							pendingStart = undefined;
+							hasStreamedContent = true;
+						}
+						if (event.type !== "start") {
+							hasStreamedContent = true;
+						}
+						outStream.push(event);
+						if (event.type === "done") {
+							return;
+						}
+					}
+
+					if (retryWaitMs !== undefined) {
+						await sleepWithAbort(retryWaitMs, options?.signal);
+						continue;
+					}
+
+					if (!hasStreamedContent && attempt < MAX_TRANSIENT_STREAM_RETRIES && !options?.signal?.aborted) {
+						await sleepWithAbort(1_500 * (attempt + 1), options?.signal);
+						continue;
+					}
+
+					emittedError = true;
+					outStream.push(
+						makeAbortErrorEvent(
+							model,
+							hasStreamedContent
+								? "Provider stream ended before completion (stream ended without completion)."
+								: "Provider stream ended before completion.",
+							Boolean(options?.signal?.aborted),
+						),
+					);
+					return;
+				} catch (err) {
+					const errMsg = err instanceof Error ? err.message : String(err);
+					if (
+						!hasStreamedContent &&
+						attempt < MAX_TRANSIENT_STREAM_RETRIES &&
+						!options?.signal?.aborted &&
+						isTransientStreamError(errMsg)
+					) {
+						await sleepWithAbort(1_500 * (attempt + 1), options?.signal);
+						continue;
+					}
+					throw err;
+				}
 			}
 		} catch (err) {
 			if (!emittedError) {
@@ -384,7 +480,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		const diagnosis = diagnoseProviderError(msg.errorMessage);
 		if (diagnosis.kind === "other") return undefined;
 
-		if (diagnosis.kind === "rate_limit_429") {
+		if (diagnosis.kind === "rate_limit_429" || diagnosis.kind === "stream_error") {
 			stats.recoveredErrors++;
 			stats.lastDiagnosis = diagnosis.summary;
 			notifyUser(ctx, `[hkbu-genai] ${diagnosis.summary}`, "warning");
