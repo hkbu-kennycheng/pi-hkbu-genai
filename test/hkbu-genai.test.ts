@@ -3,8 +3,11 @@ import test from "node:test";
 import {
 	checkToolCallSafety,
 	compactMessagesForBudget,
+	computeHkbu429RetryDelayMs,
 	diagnoseProviderError,
+	isHardQuotaExhausted,
 	isHkbuEndpointModel,
+	parseRateLimitErrorDetails,
 	sanitizeProviderPayload,
 	sanitizeToolOutputText,
 	stripAnsi,
@@ -329,4 +332,60 @@ test("diagnoseProviderError extracts Akamai reference code and 400 reason", () =
 
 	const d400 = diagnoseProviderError('API error (400): {"error":{"message":"Invalid schema"}}');
 	assert.equal(d400.kind, "http_400");
+});
+
+test("parseRateLimitErrorDetails & computeHkbu429RetryDelayMs handle MODEL_DAILY_QUOTA_IN_FLIGHT vs hard exhaustion", () => {
+	const rawInFlight =
+		'API error (429): 429 {"message":"Your remaining GPT-6 Astra prompts are currently in progress. Please wait for a response to finish.","type":"rate_limit_error","param":null,"code":"MODEL_DAILY_QUOTA_IN_FLIGHT","limit":3,"used":0,"reserved":3,"remaining":0,"retryAfterSeconds":15,"resetAt":"2026-11-19T16:00:00.000Z","model":"gpt-6-astra"}';
+
+	const inFlight = parseRateLimitErrorDetails(rawInFlight, "15");
+	assert.ok(inFlight);
+	assert.equal(inFlight.code, "MODEL_DAILY_QUOTA_IN_FLIGHT");
+	assert.equal(inFlight.model, "gpt-6-astra");
+	assert.equal(inFlight.limit, 3);
+	assert.equal(inFlight.used, 0);
+	assert.equal(inFlight.reserved, 3);
+	assert.equal(inFlight.remaining, 0);
+	assert.equal(inFlight.retryAfterSeconds, 15);
+	assert.equal(isHardQuotaExhausted(inFlight), false);
+	assert.equal(computeHkbu429RetryDelayMs(inFlight, 1, 20_000), 15_500);
+	assert.equal(computeHkbu429RetryDelayMs(inFlight, 1, 10_000), 10_000);
+	assert.equal(computeHkbu429RetryDelayMs(inFlight, 2, 20_000), null);
+
+	const headerOnly = parseRateLimitErrorDetails("Rate limited", "1.2");
+	assert.equal(headerOnly?.retryAfterSeconds, 1.2);
+	assert.equal(computeHkbu429RetryDelayMs(headerOnly, 1, 20_000), 1_700);
+
+	const hardExhausted = parseRateLimitErrorDetails(
+		JSON.stringify({
+			code: "MODEL_DAILY_QUOTA_EXHAUSTED",
+			model: "gpt-6-astra",
+			limit: 3,
+			used: 3,
+			reserved: 0,
+			remaining: 0,
+			retryAfterSeconds: 3600,
+			resetAt: "2026-11-19T16:00:00.000Z",
+		}),
+	);
+	assert.equal(isHardQuotaExhausted(hardExhausted), true);
+	assert.equal(computeHkbu429RetryDelayMs(hardExhausted, 1, 20_000), null);
+});
+
+test("diagnoseProviderError classifies 429 quota errors and suggests fallback models", () => {
+	const d429InFlight = diagnoseProviderError(
+		'API error (429): 429 {"message":"Your remaining GPT-6 Astra prompts are currently in progress.","type":"rate_limit_error","code":"MODEL_DAILY_QUOTA_IN_FLIGHT","limit":3,"used":0,"reserved":3,"remaining":0,"retryAfterSeconds":15,"resetAt":"2026-11-19T16:00:00.000Z","model":"gpt-6-astra"}',
+	);
+	assert.equal(d429InFlight.kind, "rate_limit_429");
+	assert.equal(d429InFlight.rateLimit?.code, "MODEL_DAILY_QUOTA_IN_FLIGHT");
+	assert.ok(d429InFlight.summary.includes("gpt-6-astra"));
+	assert.ok(d429InFlight.summary.includes("used=0/3"));
+	assert.ok(d429InFlight.summary.includes("reserved=3"));
+	assert.ok(d429InFlight.summary.includes("gpt-6.1-terra"));
+
+	const d429Hard = diagnoseProviderError(
+		'429 {"code":"MODEL_DAILY_QUOTA_EXHAUSTED","limit":3,"used":3,"reserved":0,"remaining":0,"model":"gpt-6-astra"}',
+	);
+	assert.equal(d429Hard.kind, "rate_limit_429");
+	assert.ok(d429Hard.summary.includes("Daily prompt quota exhausted"));
 });

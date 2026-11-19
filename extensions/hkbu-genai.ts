@@ -1,10 +1,19 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	createAssistantMessageEventStream,
+	openAICompletionsApi,
+	type Api,
+	type Model,
+	type SimpleStreamOptions,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	checkToolCallSafety,
 	compactMessagesForBudget,
+	computeHkbu429RetryDelayMs,
 	diagnoseProviderError,
 	HKBU_COMPAT,
 	HKBU_DEFAULT_MODELS,
@@ -12,6 +21,7 @@ import {
 	HKBU_PROVIDER_ID,
 	isHkbuEndpointModel,
 	isSuspectToolCallArgs,
+	parseRateLimitErrorDetails,
 	sanitizeProviderPayload,
 	sanitizeToolOutputText,
 	type CompactionState,
@@ -42,6 +52,145 @@ function getToolOutputLimits(toolName: string): { maxBytes: number; maxLines: nu
 				redactWafTriggers: toolName.startsWith("mcp__"),
 			};
 	}
+}
+
+const MAX_429_RETRY_WAIT_MS = 20_000;
+const modelRequestQueues = new Map<string, Promise<void>>();
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	if (signal?.aborted) {
+		return Promise.reject(new DOMException("Aborted", "AbortError"));
+	}
+	return new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new DOMException("Aborted", "AbortError"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function makeAbortErrorEvent(model: Model<Api>, errorMessage: string, aborted: boolean) {
+	return {
+		type: "error" as const,
+		reason: (aborted ? "aborted" : "error") as "aborted" | "error",
+		error: {
+			role: "assistant" as const,
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: (aborted ? "aborted" : "error") as "aborted" | "error",
+			errorMessage,
+			timestamp: Date.now(),
+		},
+	};
+}
+
+/**
+ * Wraps OpenAI completions streaming for HKBU GenAI so:
+ * 1) In-process requests to the same model run sequentially (reducing in-flight quota collisions
+ *    such as `gpt-6-astra`'s account-wide `MODEL_DAILY_QUOTA_IN_FLIGHT` `limit: 3`), and
+ * 2) HTTP 429 responses wait for `Retry-After` / `retryAfterSeconds` once before failing when
+ *    Pi's inner `provider-retry` (`maxRetries: undefined`) would otherwise fail immediately into
+ *    Pi's 2s/4s/8s outer backoff loop.
+ */
+function hkbuStreamSimple(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
+	const outStream = createAssistantMessageEventStream();
+	const queueKey = model.id || "__default__";
+	const prevLock = modelRequestQueues.get(queueKey) ?? Promise.resolve();
+	let releaseLock!: () => void;
+	const currentLock = new Promise<void>((resolve) => {
+		releaseLock = resolve;
+	});
+	const tailLock = prevLock.then(
+		() => currentLock,
+		() => currentLock,
+	);
+	modelRequestQueues.set(queueKey, tailLock);
+
+	(async () => {
+		let emittedError = false;
+		try {
+			await prevLock;
+			if (options?.signal?.aborted) {
+				emittedError = true;
+				outStream.push(makeAbortErrorEvent(model, "Request aborted", true));
+				return;
+			}
+
+			const baseFetch = options?.fetch ?? globalThis.fetch;
+			const wrappedFetch: typeof globalThis.fetch = async (input, init) => {
+				const signal = init?.signal ?? options?.signal;
+				const retryRequest = typeof input === "string" || input instanceof URL ? undefined : input.clone();
+				const res = await baseFetch(input, init);
+				if (res.status !== 429 || signal?.aborted) {
+					return res;
+				}
+
+				const bodyText = await res
+					.clone()
+					.text()
+					.catch(() => "");
+				const details = parseRateLimitErrorDetails(bodyText, res.headers.get("retry-after"));
+				const waitMs = computeHkbu429RetryDelayMs(details, 1, MAX_429_RETRY_WAIT_MS);
+				if (waitMs === null) {
+					return res;
+				}
+
+				try {
+					await sleepWithAbort(waitMs, signal);
+				} catch {
+					return res;
+				}
+				if (signal?.aborted) {
+					return res;
+				}
+
+				return retryRequest ? baseFetch(retryRequest, init) : baseFetch(input, init);
+			};
+
+			const innerStream = openAICompletionsApi().streamSimple(
+				model as Model<"openai-completions">,
+				context,
+				{
+					...options,
+					fetch: wrappedFetch,
+				},
+			);
+
+			for await (const event of innerStream) {
+				if (event.type === "error") emittedError = true;
+				outStream.push(event);
+			}
+		} catch (err) {
+			if (!emittedError) {
+				const errorMessage = err instanceof Error ? err.message : String(err);
+				outStream.push(makeAbortErrorEvent(model, errorMessage, Boolean(options?.signal?.aborted)));
+			}
+		} finally {
+			outStream.end();
+			releaseLock();
+			if (modelRequestQueues.get(queueKey) === tailLock) {
+				modelRequestQueues.delete(queueKey);
+			}
+		}
+	})();
+
+	return outStream;
 }
 
 export default function hkbuGenAiExtension(pi: ExtensionAPI) {
@@ -87,6 +236,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		...(envApiKey ? { apiKey: envApiKey } : {}),
 		authHeader: true,
 		api: "openai-completions",
+		streamSimple: hkbuStreamSimple,
 		models: HKBU_DEFAULT_MODELS.map(toModelDef),
 		async refreshModels({ signal, credential }: { signal: AbortSignal; credential?: { key?: string } }) {
 			const token =
@@ -233,6 +383,24 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 
 		const diagnosis = diagnoseProviderError(msg.errorMessage);
 		if (diagnosis.kind === "other") return undefined;
+
+		if (diagnosis.kind === "rate_limit_429") {
+			stats.recoveredErrors++;
+			stats.lastDiagnosis = diagnosis.summary;
+			notifyUser(ctx, `[hkbu-genai] ${diagnosis.summary}`, "warning");
+			if (typeof msg.timestamp === "number") {
+				state.droppedMessageTimestamps.add(msg.timestamp);
+			}
+			if (event.messageEntryId) {
+				return {
+					entries: [
+						...event.entries,
+						{ type: "context_edit" as const, targetId: event.messageEntryId, replacement: null },
+					],
+				};
+			}
+			return undefined;
+		}
 
 		stats.recoveredErrors++;
 		stats.lastDiagnosis = diagnosis.summary;

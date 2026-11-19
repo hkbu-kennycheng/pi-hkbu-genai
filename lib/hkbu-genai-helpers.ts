@@ -804,11 +804,97 @@ export function compactMessagesForBudget(
 	return { messages: result, changed };
 }
 
+export interface RateLimitDetails {
+	code?: string;
+	message?: string;
+	model?: string;
+	limit?: number;
+	used?: number;
+	reserved?: number;
+	remaining?: number;
+	retryAfterSeconds?: number;
+	resetAt?: string;
+}
+
 export interface ErrorDiagnosis {
-	kind: "akamai_403" | "http_400" | "other";
+	kind: "akamai_403" | "http_400" | "rate_limit_429" | "other";
 	summary: string;
 	referenceCode?: string;
 	deniedReason?: string;
+	rateLimit?: RateLimitDetails;
+}
+
+export function parseRateLimitErrorDetails(
+	rawText: string | undefined,
+	retryAfterHeader?: string | null,
+): RateLimitDetails | undefined {
+	let obj: Record<string, any> | undefined;
+	if (rawText) {
+		const jsonStart = rawText.indexOf("{");
+		if (jsonStart !== -1) {
+			const slice = rawText.slice(jsonStart);
+			for (let end = slice.lastIndexOf("}"); end > 0; end = slice.lastIndexOf("}", end - 1)) {
+				try {
+					const parsed = JSON.parse(slice.slice(0, end + 1));
+					if (parsed && typeof parsed === "object") {
+						obj = parsed.error && typeof parsed.error === "object" ? parsed.error : parsed;
+						break;
+					}
+				} catch {
+					// Continue narrowing in case trailing text (e.g. `(stopReason=error...)`) contains braces
+				}
+			}
+		}
+	}
+
+	const headerSec = retryAfterHeader ? Number.parseFloat(retryAfterHeader) : Number.NaN;
+	const retryAfterSeconds =
+		typeof obj?.retryAfterSeconds === "number"
+			? obj.retryAfterSeconds
+			: Number.isFinite(headerSec)
+				? headerSec
+				: undefined;
+
+	if (!obj && retryAfterSeconds === undefined) return undefined;
+
+	const details: RateLimitDetails = {
+		code: typeof obj?.code === "string" ? obj.code : undefined,
+		message: typeof obj?.message === "string" ? obj.message : undefined,
+		model: typeof obj?.model === "string" ? obj.model : undefined,
+		limit: typeof obj?.limit === "number" ? obj.limit : undefined,
+		used: typeof obj?.used === "number" ? obj.used : undefined,
+		reserved: typeof obj?.reserved === "number" ? obj.reserved : undefined,
+		remaining: typeof obj?.remaining === "number" ? obj.remaining : undefined,
+		retryAfterSeconds,
+		resetAt: typeof obj?.resetAt === "string" ? obj.resetAt : undefined,
+	};
+	return details;
+}
+
+export function isHardQuotaExhausted(details: RateLimitDetails | undefined): boolean {
+	if (!details) return false;
+	return (
+		details.limit !== undefined &&
+		details.remaining === 0 &&
+		(details.reserved ?? 0) === 0 &&
+		(details.used ?? 0) >= details.limit
+	);
+}
+
+/**
+ * Compute how long (ms) to wait after an HKBU GenAI 429 response before one retry attempt.
+ * Honors `retryAfterSeconds` / `Retry-After` (+500 ms clock margin) instead of Pi's short 2s/4s/8s backoff,
+ * and skips sleeping if daily quota is hard-exhausted (`reserved === 0` and `used >= limit`).
+ */
+export function computeHkbu429RetryDelayMs(
+	details: RateLimitDetails | undefined,
+	attempt: number,
+	maxWaitMs = 20_000,
+): number | null {
+	if (attempt !== 1 || isHardQuotaExhausted(details)) return null;
+	const sec = details?.retryAfterSeconds;
+	const rawMs = sec !== undefined && Number.isFinite(sec) && sec > 0 ? Math.ceil(sec * 1000) + 500 : 5_000;
+	return Math.min(maxWaitMs, Math.max(1_000, rawMs));
 }
 
 export function diagnoseProviderError(errorMessage: string | undefined): ErrorDiagnosis {
@@ -826,6 +912,33 @@ export function diagnoseProviderError(errorMessage: string | undefined): ErrorDi
 			deniedReason,
 			referenceCode,
 			summary: `Akamai WAF 403 (${deniedReason ? `Reason=${deniedReason}` : "Web Policy"}${referenceCode ? `, Ref=${referenceCode}` : ""}). Likely triggered by an HTML script tag, eval call, or semicolon command chain inside tool arguments/output.`,
+		};
+	}
+
+	if (
+		/(?<![a-z0-9])429(?![a-z0-9])/.test(errorMessage) ||
+		errorMessage.includes("rate_limit_error") ||
+		errorMessage.includes("MODEL_DAILY_QUOTA")
+	) {
+		const rateLimit = parseRateLimitErrorDetails(errorMessage);
+		const statsParts: string[] = [];
+		if (rateLimit?.code) statsParts.push(rateLimit.code);
+		if (rateLimit?.used !== undefined && rateLimit?.limit !== undefined) {
+			statsParts.push(`used=${rateLimit.used}/${rateLimit.limit}`);
+		}
+		if (rateLimit?.reserved !== undefined) statsParts.push(`reserved=${rateLimit.reserved}`);
+		if (rateLimit?.remaining !== undefined) statsParts.push(`remaining=${rateLimit.remaining}`);
+		if (rateLimit?.retryAfterSeconds !== undefined) statsParts.push(`retryAfter=${rateLimit.retryAfterSeconds}s`);
+		if (rateLimit?.resetAt) statsParts.push(`resetAt=${rateLimit.resetAt}`);
+		const modelLabel = rateLimit?.model ? ` on ${rateLimit.model}` : "";
+		const detailSuffix = statsParts.length > 0 ? ` (${statsParts.join(", ")})` : "";
+		const advice = isHardQuotaExhausted(rateLimit)
+			? "Daily prompt quota exhausted; switch to gpt-6.1-terra, gpt-6.1-sol, or gpt-6-luna."
+			: "In-flight/rate quota slots are saturated on this model; wait for server reservations to clear or switch to gpt-6.1-terra, gpt-6.1-sol, or gpt-6-luna.";
+		return {
+			kind: "rate_limit_429",
+			rateLimit,
+			summary: `HKBU GenAI 429 rate/quota limit${modelLabel}${detailSuffix}. ${advice}`,
 		};
 	}
 

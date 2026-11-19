@@ -247,7 +247,7 @@ Because this gateway implements the standard OpenAI `/v1` schema, any client sup
 
 ### Pi Coding Agent Extension (`pi-hkbu-genai`)
 
-This repository is a [Pi](https://github.com/earendil-works/pi) package ([package.json](package.json), [extensions/hkbu-genai.ts](extensions/hkbu-genai.ts), [lib/hkbu-genai-helpers.ts](lib/hkbu-genai-helpers.ts)) built specifically to avoid Akamai `403` and backend `400` errors in long-running agentic tasks.
+This repository is a [Pi](https://github.com/earendil-works/pi) package ([package.json](package.json), [extensions/hkbu-genai.ts](extensions/hkbu-genai.ts), [lib/hkbu-genai-helpers.ts](lib/hkbu-genai-helpers.ts)) built specifically to avoid Akamai `403`, backend `400`, and `429` retry/quota pitfalls in long-running agentic tasks.
 
 #### Install from GitHub
 
@@ -323,4 +323,4 @@ What the extension configures and guards against:
   - Do not send `Content-Encoding: gzip` (the backend rejects compressed JSON bodies with `400`).
   - When switching between Gemini and GPT models in the same transcript, adapt or fold `tool_calls` IDs (`call_gctx_v1_...` exceeds GPT's 64-char `call_id` limit, while Gemini rejects `tool_calls` lacking a `call_gctx_` thought signature).
 - **`404 Not Found`:** Returned if calling unsupported OpenAI routes such as `/completions`, `/images/generations`, `/audio/transcriptions`, `/files`, `/batches`, or `/moderations`.
-- **`429 Too Many Requests`:** Respect the `Retry-After` response header and apply exponential backoff.
+- **`429 Too Many Requests` (`rate_limit_error` / `MODEL_DAILY_QUOTA_IN_FLIGHT`):** Honor the `Retry-After` response header / `retryAfterSeconds` field before retrying (`gpt-6-astra` enforces a strict account-wide `limit: 3` daily/in-flight quota with `Retry-After: 15`). `pi-hkbu-genai` serializes concurrent in-process requests per model, waits for `Retry-After` once when slots are in flight, skips pointless waits on hard daily exhaustion (`used >= limit` and `reserved === 0`), and suggests high-quota alternatives (`gpt-6.1-terra`, `gpt-6.1-sol`, `gpt-6-luna`).
