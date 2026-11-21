@@ -163,6 +163,9 @@ const MAX_REPLAYED_FILE_TOOL_ARG_CHARS = 350;
 
 export function isHkbuEndpointModel(model: { provider?: string; baseUrl?: string } | undefined): boolean {
 	if (!model) return false;
+	if (model.provider === "hkbu-genai-web" || (model.baseUrl ?? "").includes("genai.hkbu.edu.hk/api/v0")) {
+		return false;
+	}
 	return model.provider === HKBU_PROVIDER_ID || (model.baseUrl ?? "").includes("genai.hkbu.edu.hk");
 }
 

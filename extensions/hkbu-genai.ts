@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +30,23 @@ import {
 	type CompactionState,
 	type HkbuModelCatalogEntry,
 } from "../lib/hkbu-genai-helpers.ts";
+import {
+	buildWebRequestBody,
+	createWebSessionState,
+	extractTranscriptParts,
+	HKBU_WEB_BASE_URL,
+	HKBU_WEB_COMPLETIONS_URL,
+	HKBU_WEB_PROVIDER_ID,
+	inspectHkbuWebToken,
+	isHkbuWebModel,
+	parseWebSseDataLine,
+	planWebTurn,
+	uploadFileToHkbuWeb,
+	WebContentStreamParser,
+	type StreamSegment,
+	type WebSessionState,
+} from "../lib/hkbu-genai-web.ts";
+import { createHkbuWebOAuthProvider } from "../lib/hkbu-genai-web-auth.ts";
 
 const BASH_MAX_BYTES = 6 * 1024;
 const BASH_MAX_LINES = 100;
@@ -289,6 +307,398 @@ function hkbuStreamSimple(model: Model<Api>, context: TranscriptContext, options
 	return outStream;
 }
 
+/**
+ * Custom streamSimple adapter for HKBU GenAI's web-chat endpoint
+ * (`POST https://genai.hkbu.edu.hk/api/v0/general/chat/completions`),
+ * supporting hybrid `chat_session_id` reuse, inline `<think>` parsing,
+ * and prompt-emulated tool calling for Pi's coding tools.
+ */
+function createHkbuWebStreamSimple(webSession: WebSessionState) {
+	return function hkbuWebStreamSimple(
+		model: Model<Api>,
+		context: TranscriptContext,
+		options?: SimpleStreamOptions,
+	) {
+		const outStream = createAssistantMessageEventStream();
+		const queueKey = `web:${model.id || "__default__"}`;
+		const prevLock = modelRequestQueues.get(queueKey) ?? Promise.resolve();
+		let releaseLock!: () => void;
+		const currentLock = new Promise<void>((resolve) => {
+			releaseLock = resolve;
+		});
+		const tailLock = prevLock.then(
+			() => currentLock,
+			() => currentLock,
+		);
+		modelRequestQueues.set(queueKey, tailLock);
+
+		(async () => {
+			let emittedError = false;
+			try {
+				await prevLock;
+				if (options?.signal?.aborted) {
+					emittedError = true;
+					outStream.push(makeAbortErrorEvent(model, "Request aborted", true));
+					return;
+				}
+
+				const rawToken = (options as any)?.apiKey || process.env.HKBU_GENAI_WEB_TOKEN || "";
+				const token = String(rawToken).replace(/^Bearer\s+/i, "").trim();
+				if (!token) {
+					emittedError = true;
+					outStream.push(
+						makeAbortErrorEvent(
+							model,
+							"Missing HKBU_GENAI_WEB_TOKEN for hkbu-genai-web provider. Export your HKBU GenAI web Bearer JWT in HKBU_GENAI_WEB_TOKEN.",
+							false,
+						),
+					);
+					return;
+				}
+
+				const tokenInfo = inspectHkbuWebToken(token);
+				if (tokenInfo.validFormat && tokenInfo.isExpired) {
+					emittedError = true;
+					outStream.push(
+						makeAbortErrorEvent(
+							model,
+							`HKBU_GENAI_WEB_TOKEN expired at ${tokenInfo.expiresAtIso}. Sign in to https://genai.hkbu.edu.hk and update HKBU_GENAI_WEB_TOKEN.`,
+							false,
+						),
+					);
+					return;
+				}
+
+				const baseFetch = options?.fetch ?? globalThis.fetch;
+				const { systemPrompt, tools, messages: chatMessages } = extractTranscriptParts(context);
+				const enableToolEmulation = tools.length > 0;
+				const knownToolNames = new Set(tools.map((t) => t.name));
+				const useGoogle = /^(1|true|yes)$/i.test(process.env.HKBU_GENAI_WEB_USE_GOOGLE ?? "");
+
+				let forceFreshSession = false;
+
+				for (let attempt = 0; attempt <= MAX_TRANSIENT_STREAM_RETRIES; attempt++) {
+					if (forceFreshSession) {
+						webSession.conversationUuid = null;
+						webSession.modelId = null;
+						webSession.syncedMessageCount = 0;
+						webSession.syncedPrefixFingerprint = null;
+						forceFreshSession = false;
+					}
+
+					const plan = planWebTurn(
+						webSession,
+						model.id,
+						chatMessages,
+						systemPrompt,
+						tools,
+					);
+					const uploadIds =
+						plan.images.length > 0
+							? await Promise.all(
+									plan.images.map((img) =>
+										uploadFileToHkbuWeb(img, token, {
+											fetch: baseFetch,
+											signal: options?.signal,
+										}),
+									),
+								)
+							: [];
+					const body = buildWebRequestBody(plan, model.id, { useGoogle, stream: true, uploadIds });
+					if (process.env.HKBU_GENAI_WEB_DEBUG) {
+						process.stderr.write(
+							`[hkbu-genai-web debug] tools=${tools.length} reused=${plan.reusedSession} uploads=${uploadIds.length} instLen=${body.instructions?.length ?? 0} promptLen=${body.prompt.length}\n`,
+						);
+					}
+
+					const doFetch = async () =>
+						baseFetch(HKBU_WEB_COMPLETIONS_URL, {
+							method: "POST",
+							headers: {
+								Accept: "text/event-stream, application/json",
+								Authorization: `Bearer ${token}`,
+								"Content-Type": "application/json",
+								"idempotency-key": randomUUID(),
+							},
+							body: JSON.stringify(body),
+							signal: options?.signal,
+						});
+
+					let res = await doFetch();
+
+					// Handle 404 Conversation not found on reused session by rotating cleanly once
+					if (res.status === 404 && plan.reusedSession && attempt < MAX_TRANSIENT_STREAM_RETRIES) {
+						const errBody = await res.text().catch(() => "");
+						if (/conversation not found/i.test(errBody)) {
+							forceFreshSession = true;
+							continue;
+						}
+						emittedError = true;
+						outStream.push(makeAbortErrorEvent(model, `API error (404): ${errBody}`, false));
+						return;
+					}
+
+					// Handle HTTP 429 once using Retry-After / retryAfterSeconds
+					if (res.status === 429 && !options?.signal?.aborted) {
+						const bodyText = await res.clone().text().catch(() => "");
+						const details = parseRateLimitErrorDetails(bodyText, res.headers.get("retry-after"));
+						const waitMs = computeHkbu429RetryDelayMs(details, 1, MAX_429_RETRY_WAIT_MS);
+						if (waitMs !== null) {
+							await sleepWithAbort(waitMs, options?.signal);
+							res = await doFetch();
+						}
+					}
+
+					if (!res.ok) {
+						const errBody = await res.text().catch(() => "");
+						const errMsg = `API error (${res.status}): ${errBody}`;
+						if (
+							attempt < MAX_TRANSIENT_STREAM_RETRIES &&
+							!options?.signal?.aborted &&
+							isTransientStreamError(errMsg)
+						) {
+							await sleepWithAbort(1_500 * (attempt + 1), options?.signal);
+							continue;
+						}
+						emittedError = true;
+						outStream.push(makeAbortErrorEvent(model, errMsg, false));
+						return;
+					}
+
+					const output: any = {
+						role: "assistant",
+						content: [],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+
+					let started = false;
+					let activeBlockType: "text" | "thinking" | null = null;
+					let activeBlockIndex = -1;
+					let hasToolCalls = false;
+					let sawFinish = false;
+					let finishReason: string | null = null;
+					let returnedConversationUuid: string | undefined;
+
+					const ensureStarted = () => {
+						if (!started) {
+							started = true;
+							outStream.push({ type: "start", partial: output });
+						}
+					};
+
+					const closeActiveBlock = () => {
+						if (activeBlockType === "text" && activeBlockIndex >= 0) {
+							const blk = output.content[activeBlockIndex];
+							outStream.push({
+								type: "text_end",
+								contentIndex: activeBlockIndex,
+								content: blk?.text ?? "",
+								partial: output,
+							});
+						} else if (activeBlockType === "thinking" && activeBlockIndex >= 0) {
+							const blk = output.content[activeBlockIndex];
+							outStream.push({
+								type: "thinking_end",
+								contentIndex: activeBlockIndex,
+								content: blk?.thinking ?? "",
+								partial: output,
+							});
+						}
+						activeBlockType = null;
+						activeBlockIndex = -1;
+					};
+
+					const emitSegments = (segments: StreamSegment[]) => {
+						for (const seg of segments) {
+							ensureStarted();
+							if (seg.type === "thinking") {
+								if (activeBlockType !== "thinking") {
+									closeActiveBlock();
+									activeBlockIndex = output.content.length;
+									output.content.push({ type: "thinking", thinking: "" });
+									activeBlockType = "thinking";
+									outStream.push({
+										type: "thinking_start",
+										contentIndex: activeBlockIndex,
+										partial: output,
+									});
+								}
+								output.content[activeBlockIndex].thinking += seg.delta;
+								outStream.push({
+									type: "thinking_delta",
+									contentIndex: activeBlockIndex,
+									delta: seg.delta,
+									partial: output,
+								});
+							} else if (seg.type === "text") {
+								if (activeBlockType !== "text") {
+									closeActiveBlock();
+									activeBlockIndex = output.content.length;
+									output.content.push({ type: "text", text: "" });
+									activeBlockType = "text";
+									outStream.push({
+										type: "text_start",
+										contentIndex: activeBlockIndex,
+										partial: output,
+									});
+								}
+								output.content[activeBlockIndex].text += seg.delta;
+								outStream.push({
+									type: "text_delta",
+									contentIndex: activeBlockIndex,
+									delta: seg.delta,
+									partial: output,
+								});
+							} else if (seg.type === "tool_call") {
+								closeActiveBlock();
+								hasToolCalls = true;
+								const idx = output.content.length;
+								const toolCall = {
+									type: "toolCall" as const,
+									id: seg.id,
+									name: seg.name,
+									arguments: seg.arguments,
+								};
+								output.content.push(toolCall);
+								outStream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+								outStream.push({
+									type: "toolcall_delta",
+									contentIndex: idx,
+									delta: JSON.stringify(seg.arguments),
+									partial: output,
+								});
+								outStream.push({ type: "toolcall_end", contentIndex: idx, toolCall, partial: output });
+							}
+						}
+					};
+
+					const parser = new WebContentStreamParser({ enableToolEmulation, knownToolNames });
+					const contentType = res.headers.get("content-type") ?? "";
+
+					const processEventLine = (line: string) => {
+						const parsed = parseWebSseDataLine(line);
+						if (parsed.kind === "ignore") return;
+						if (parsed.kind === "tool_status") {
+							if (parsed.conversationUuid) returnedConversationUuid = parsed.conversationUuid;
+							return;
+						}
+						if (parsed.kind === "done") {
+							sawFinish = true;
+							return;
+						}
+						if (parsed.kind === "duplicate") {
+							throw new Error("Duplicate idempotency-key response from HKBU GenAI web backend.");
+						}
+						if (parsed.conversationUuid) returnedConversationUuid = parsed.conversationUuid;
+						if (parsed.usage) {
+							output.usage.input = parsed.usage.promptTokens;
+							output.usage.output = parsed.usage.completionTokens;
+							output.usage.totalTokens = parsed.usage.totalTokens;
+						}
+						if (parsed.reasoningDelta) {
+							emitSegments([{ type: "thinking", delta: parsed.reasoningDelta }]);
+						}
+						if (parsed.contentDelta) {
+							emitSegments(parser.push(parsed.contentDelta));
+						}
+						if (parsed.finishReason) {
+							finishReason = parsed.finishReason;
+							sawFinish = true;
+						}
+					};
+
+					if (contentType.includes("application/json")) {
+						const rawJson = await res.text();
+						processEventLine(rawJson);
+						sawFinish = true;
+					} else if (res.body) {
+						const reader = res.body.getReader();
+						const decoder = new TextDecoder();
+						let lineBuf = "";
+						while (true) {
+							const { value, done } = await reader.read();
+							if (done) break;
+							lineBuf += decoder.decode(value, { stream: true });
+							let nlIdx: number;
+							while ((nlIdx = lineBuf.indexOf("\n")) !== -1) {
+								const line = lineBuf.slice(0, nlIdx);
+								lineBuf = lineBuf.slice(nlIdx + 1);
+								processEventLine(line);
+							}
+						}
+						lineBuf += decoder.decode();
+						if (lineBuf.trim()) {
+							processEventLine(lineBuf);
+						}
+					}
+
+					emitSegments(parser.flush());
+					closeActiveBlock();
+
+					if (!started && !sawFinish) {
+						if (attempt < MAX_TRANSIENT_STREAM_RETRIES && !options?.signal?.aborted) {
+							await sleepWithAbort(1_500 * (attempt + 1), options?.signal);
+							continue;
+						}
+						emittedError = true;
+						outStream.push(
+							makeAbortErrorEvent(
+								model,
+								"Provider stream ended before completion.",
+								Boolean(options?.signal?.aborted),
+							),
+						);
+						return;
+					}
+
+					ensureStarted();
+					const finalReason: "stop" | "length" | "toolUse" = hasToolCalls
+						? "toolUse"
+						: finishReason === "length"
+							? "length"
+							: "stop";
+					output.stopReason = finalReason;
+
+					if (returnedConversationUuid) {
+						webSession.conversationUuid = returnedConversationUuid;
+						webSession.modelId = model.id;
+						webSession.syncedMessageCount = plan.nextSyncedMessageCount;
+						webSession.syncedPrefixFingerprint = plan.nextSyncedFingerprint;
+					}
+
+					outStream.push({ type: "done", reason: finalReason, message: output });
+					return;
+				}
+			} catch (err) {
+				if (!emittedError) {
+					const errorMessage = err instanceof Error ? err.message : String(err);
+					outStream.push(makeAbortErrorEvent(model, errorMessage, Boolean(options?.signal?.aborted)));
+				}
+			} finally {
+				outStream.end();
+				releaseLock();
+				if (modelRequestQueues.get(queueKey) === tailLock) {
+					modelRequestQueues.delete(queueKey);
+				}
+			}
+		})();
+
+		return outStream;
+	};
+}
+
 export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 	const logDir = join(tmpdir(), "pi-hkbu-genai", String(process.pid));
 	let spilloverCounter = 0;
@@ -299,6 +709,7 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		replacedToolResults: new Map<string, string>(),
 		compactedToolCallIds: new Set<string>(),
 	};
+	const webSession: WebSessionState = createWebSessionState();
 
 	const stats = {
 		preflightBlocks: 0,
@@ -320,6 +731,8 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		: process.env.OPENAI_API_KEY
 			? "$OPENAI_API_KEY"
 			: undefined;
+
+	const envWebToken = process.env.HKBU_GENAI_WEB_TOKEN ? "$HKBU_GENAI_WEB_TOKEN" : undefined;
 
 	const toModelDef = (entry: HkbuModelCatalogEntry) => ({
 		...entry,
@@ -372,6 +785,22 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerProvider(HKBU_WEB_PROVIDER_ID, {
+		name: "HKBU GenAI Web (/api/v0, Tool-Emulated)",
+		baseUrl: HKBU_WEB_BASE_URL,
+		...(envWebToken ? { apiKey: envWebToken } : {}),
+		authHeader: true,
+		api: "openai-completions",
+		oauth: createHkbuWebOAuthProvider(),
+		streamSimple: createHkbuWebStreamSimple(webSession),
+		models: HKBU_DEFAULT_MODELS.map((entry) =>
+			toModelDef({
+				...entry,
+				name: entry.name.replace("(HKBU)", "(HKBU Web)"),
+			}),
+		),
+	});
+
 	const notifyUser = (ctx: ExtensionContext, msg: string, level: "info" | "warning" | "error" = "warning") => {
 		if (ctx.hasUI) {
 			ctx.ui.notify(msg, level);
@@ -383,6 +812,10 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		state.droppedMessageTimestamps.clear();
 		state.replacedToolResults.clear();
 		state.compactedToolCallIds?.clear();
+		webSession.conversationUuid = null;
+		webSession.modelId = null;
+		webSession.syncedMessageCount = 0;
+		webSession.syncedPrefixFingerprint = null;
 	});
 
 	// 1. Prompt hygiene so the agent avoids Akamai-triggering patterns naturally
@@ -471,11 +904,29 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 		return sanitizeProviderPayload(event.payload, ctx.model?.id ?? "");
 	});
 
-	// 7. Diagnose 403 / 400 failures and unbrick context for subsequent turns
+	// 7. Diagnose 403 / 400 / 429 / stream failures and unbrick context for subsequent turns
 	pi.on("turn_end", async (event, ctx) => {
-		if (!isHkbuEndpointModel(ctx.model)) return undefined;
+		const isV1 = isHkbuEndpointModel(ctx.model);
+		const isWeb = isHkbuWebModel(ctx.model);
+		if (!isV1 && !isWeb) return undefined;
 		const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string; timestamp?: number };
 		if (msg?.role !== "assistant" || msg.stopReason !== "error") return undefined;
+
+		if (isWeb) {
+			const webDiag = diagnoseProviderError(msg.errorMessage);
+			stats.recoveredErrors++;
+			stats.lastDiagnosis = webDiag.summary;
+			notifyUser(ctx, `[hkbu-genai-web] ${webDiag.summary}`, "warning");
+			if (event.messageEntryId) {
+				return {
+					entries: [
+						...event.entries,
+						{ type: "context_edit" as const, targetId: event.messageEntryId, replacement: null },
+					],
+				};
+			}
+			return undefined;
+		}
 
 		const diagnosis = diagnoseProviderError(msg.errorMessage);
 		if (diagnosis.kind === "other") return undefined;
@@ -622,6 +1073,22 @@ export default function hkbuGenAiExtension(pi: ExtensionAPI) {
 	pi.registerCommand("hkbu-status", {
 		description: "Show HKBU GenAI gateway compatibility and guard statistics",
 		handler: async (_args, ctx) => {
+			if (isHkbuWebModel(ctx.model)) {
+				const tokenInfo = inspectHkbuWebToken(process.env.HKBU_GENAI_WEB_TOKEN);
+				const tokenSummary = tokenInfo.validFormat
+					? tokenInfo.isExpired
+						? `EXPIRED(${tokenInfo.expiresAtIso})`
+						: `validUntil=${tokenInfo.expiresAtIso}`
+					: process.env.HKBU_GENAI_WEB_TOKEN
+						? "set(non-JWT)"
+						: "unset";
+				notifyUser(
+					ctx,
+					`hkbu-genai-web status | model=${ctx.model?.provider}/${ctx.model?.id} | session=${webSession.conversationUuid ?? "new"} | syncedMsgs=${webSession.syncedMessageCount} | token=${tokenSummary} | recoveredErrors=${stats.recoveredErrors}${stats.lastDiagnosis ? ` | lastError=${stats.lastDiagnosis}` : ""}`,
+					"info",
+				);
+				return;
+			}
 			notifyUser(
 				ctx,
 				`hkbu-genai status | model=${ctx.model?.provider}/${ctx.model?.id} | preflightBlocks=${stats.preflightBlocks} | redactedOutputs=${stats.redactedOutputs} | truncatedOutputs=${stats.truncatedOutputs} | recoveredErrors=${stats.recoveredErrors} | logs=${logDir}${stats.lastDiagnosis ? ` | lastError=${stats.lastDiagnosis}` : ""}`,

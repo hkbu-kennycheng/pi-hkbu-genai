@@ -247,7 +247,7 @@ Because this gateway implements the standard OpenAI `/v1` schema, any client sup
 
 ### Pi Coding Agent Extension (`pi-hkbu-genai`)
 
-This repository is a [Pi](https://github.com/earendil-works/pi) package ([package.json](package.json), [extensions/hkbu-genai.ts](extensions/hkbu-genai.ts), [lib/hkbu-genai-helpers.ts](lib/hkbu-genai-helpers.ts)) built specifically to avoid Akamai `403`, backend `400`, and `429` retry/quota pitfalls in long-running agentic tasks.
+This repository is a [Pi](https://github.com/earendil-works/pi) package ([package.json](package.json), [extensions/hkbu-genai.ts](extensions/hkbu-genai.ts), [lib/hkbu-genai-helpers.ts](lib/hkbu-genai-helpers.ts), [lib/hkbu-genai-web.ts](lib/hkbu-genai-web.ts)) built specifically to avoid Akamai `403`, backend `400`, and `429` retry/quota pitfalls on `/api/v1`, and to provide a second provider (`hkbu-genai-web`) backed by the HKBU GenAI web-chat `/api/v0` endpoint.
 
 #### Install from GitHub
 
@@ -279,7 +279,35 @@ npm test
 pi -e . --provider hkbu-genai --model gpt-6.1-terra
 ```
 
-What the extension configures and guards against:
+#### Second Provider: `hkbu-genai-web` (`/api/v0/general/chat/completions`)
+
+`pi-hkbu-genai` also registers **`hkbu-genai-web`**, which connects to HKBU GenAI's web-chat backend (`https://genai.hkbu.edu.hk/api/v0/general/chat/completions`) using your ~30-day HKBU GenAI web Bearer JWT (separate quota pool from `/api/v1` API keys):
+
+```bash
+# Option 1: Browser SSO login (opens Chrome via CDP, captures JWT into ~/.pi/agent/auth.json)
+# Run /login inside Pi and select hkbu-genai-web (or `pi auth login hkbu-genai-web` once installed)
+
+# Option 2: Or pass the Bearer JWT directly via environment variable
+export HKBU_GENAI_WEB_TOKEN="<YOUR_WEB_BEARER_JWT>"
+
+pi -e . --provider hkbu-genai-web --model gpt-6-luna
+```
+
+Optional environment variables:
+
+- `HKBU_GENAI_CHROME_PATH`: custom path to Chrome/Chromium/Brave/Edge for SSO login.
+- `HKBU_GENAI_NO_BROWSER=1`: skip launching Chrome and prompt to paste the Bearer JWT manually.
+- `HKBU_GENAI_WEB_USE_GOOGLE=1`: enables HKBU's built-in hosted web search (`useGoogle: true`).
+- `HKBU_GENAI_WEB_DEBUG=1`: logs per-turn diagnostics (tool count, session reuse, upload count, instruction/prompt lengths) to `stderr`.
+
+What `hkbu-genai-web` handles automatically:
+
+1. **Non-OpenAI Request Translation & Hybrid Sessions:** Extracts Pi's system prompt and active tool definitions into `instructions`, omits `chat_session_id` on turn 1 to create a conversation, reuses the returned `conversation_uuid` with delta-only prompts on subsequent turns, and automatically rotates to a fresh session with serialized history on model switches (since `/api/v0` locks `model` per session), context compaction/rewind, or `404 Conversation not found`.
+2. **Full Prompt-Emulated Tool Calling:** Because `/api/v0/general/chat/completions` ignores OpenAI `tools`, the adapter injects a compact JSON tool-calling protocol into `instructions` (instructing reasoning models to emit calls in the final visible reply), formats Pi `toolResult` messages as structured tool-result blocks, and parses streamed tool calls into native Pi `toolCall` events (`stopReason: "toolUse"`).
+3. **Automatic Image Uploads (Vision):** Extracts `PNG`, `JPEG`, `WEBP`, and `TIFF` image blocks from user messages and tool results (such as `read` on image files or computer-use screenshots), uploads them via the 2-step `/api/v0/general/chat/uploads` flow (`POST /chat/uploads` -> `PUT /chat/uploads/{id}/content` with `x-upload-token` and `multipart/form-data`), and attaches the resulting `uploadIds` alongside a fresh `idempotency-key`. Text and code tool outputs remain inline in `prompt` for speed and token efficiency.
+4. **Streaming Normalization, Token Checks & Status:** Parses inline reasoning blocks into Pi thinking events, ignores non-OpenAI `tool_status` frames, decodes the JWT `exp` claim locally to fail fast with a clear message when expired, skips `/api/v1`-only Akamai WAF preflight blocks, and reports session UUID and token expiry via `/hkbu-status`.
+
+What the extension configures and guards against (`hkbu-genai` / `/api/v1`):
 
 1. **Uses `/chat/completions` (`openai-completions`) instead of `/responses` (`openai-responses`):**
    - Akamai WAF blocks shell commands/code inside `/responses` `function_call_output.output` and string `input`, whereas `/chat/completions` `messages[*].content` (including `role: "tool"`) allows standard command outputs.
